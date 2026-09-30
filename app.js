@@ -348,7 +348,12 @@ async function boot() {
   S.be.onAuth(async u => {
     if (!u) return renderSignIn();
     if (!u.verified) return renderVerify(u.email);
-    try { S.user = await S.be.profile(); } catch (e) { S.user = null; }
+    // A sign-in token issued before the email was verified is refused by the rules. Refresh it once and retry.
+    let err = null;
+    try { S.user = await S.be.profile(); } catch (e) {
+      try { await S.be.refresh(); S.user = await S.be.profile(); } catch (e2) { S.user = null; err = e2; }
+    }
+    if (!S.user && err) return renderLoadError(u.email, err);
     if (!S.user) return renderNotRostered(u.email);
     await loadShared();
     renderShell();
@@ -410,6 +415,11 @@ function renderVerify(email) {
   wireSignOut();
   $('#cont').onclick = async () => { if (await S.be.refresh()) location.reload(); else toast('Not verified yet. Open the link in the email first.', true); };
   $('#again').onclick = async () => { try { await S.be.resendVerify(); toast('Sent.'); } catch (x) { toast(friendly(x), true); } };
+}
+function renderLoadError(email, e) {
+  $('#who').innerHTML = signOutBtn();
+  $('#app').innerHTML = `<div class="panel narrow"><h2>Could not open your account</h2><p><b>${esc(email)}</b> is signed in, but the app could not load your access (${esc(e.code || e.message)}). Tap Sign out, sign back in, and try again. If it keeps happening, send this screen to Frank Pina.</p></div>`;
+  wireSignOut();
 }
 function renderNotRostered(email) {
   $('#who').innerHTML = signOutBtn();
