@@ -446,7 +446,7 @@ function pickers(mine = false) {
   const months = S.meta.months || [];
   const showStore = S.user.role !== 'consultant' && !mine;
   const asOf = S.meta.asOf?.[S.month], sAsOf = S.meta.storeAsOf?.[S.month];
-  const weeks = S.meta.weeks || [];
+  const weeks = weeksInMonth(S.month);
   const wkLabel = w => `${dateLabel(w).slice(0, 5)} to ${dateLabel(S.meta.weekTo?.[w] || addDaysIso(w, 6)).slice(0, 5)}`;
   return `<div class="pickers">
     <label>Month<select id="pm">${months.map(m => `<option value="${m}" ${m === S.month ? 'selected' : ''}>${monthLabel(m)}</option>`).join('')}</select></label>
@@ -462,9 +462,13 @@ function wirePickers() {
   if (ps) ps.onchange = () => { S.store = ps.value; S.selected = null; again(); };
   if (pv) pv.onchange = () => { S.view = pv.value; again(); };
 }
-// The week shown next to month to date: the one picked, else the latest on file.
+// Weeks that touch the picked month (Monday or Sunday falls in it), newest first.
+function weeksInMonth(m) {
+  return (S.meta.weeks || []).filter(w => w.slice(0, 7) === m || (S.meta.weekTo?.[w] || addDaysIso(w, 6)).slice(0, 7) === m);
+}
+// The week shown next to month to date: the one picked, else the latest in that month.
 function shownWeek() {
-  const weeks = S.meta.weeks || [];
+  const weeks = weeksInMonth(S.month);
   if (!weeks.includes(S.view)) S.view = weeks[0] || null;
   return S.view;
 }
