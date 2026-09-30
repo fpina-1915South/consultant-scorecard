@@ -1,0 +1,1147 @@
+import { firebaseConfig, OWNER_EMAIL } from './config.js';
+import {
+  METRICS, STORE_METRICS, COACHING, pickFocus, weeklyTarget, DEFAULT_GOALS, STORES, DISTRICTS, OUTLETS, canonicalStore,
+  minSphFor, rollingSph, minStatus, monthsBack, isOutlet, goalsFor, paceFactor, status, fmt, fmtGoal, slug, cidOf,
+  parseRsa, parseDailyReport, rangeFromFileName, addRanks, daysBetween, TEAM_FOCUS, pickStoreFocus,
+  parseTeamRoster, resolveReportNames
+} from './core.js';
+
+const DEMO = !firebaseConfig.apiKey || firebaseConfig.apiKey.startsWith('PASTE');
+const FB = 'https://www.gstatic.com/firebasejs/10.12.2/';
+const ROLES = [
+  ['admin', 'Admin'], ['exec', 'Executive (view all)'], ['director', 'Director'],
+  ['leader', 'Store leader'], ['consultant', 'Consultant']
+];
+const roleLabel = r => (ROLES.find(x => x[0] === r) || [r, r])[1];
+const SKIP = '__skip';   // directory value for "not a consultant"
+
+// ---------------------------------------------------------------- helpers
+const $ = sel => document.querySelector(sel);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const monthLabel = m => { const [y, mo] = m.split('-').map(Number); return new Date(y, mo - 1, 1).toLocaleString('en-US', { month: 'long', year: 'numeric' }); };
+const dateLabel = d => { if (!d) return ''; const [y, m, dd] = d.split('-'); return `${m}/${dd}/${y}`; };
+const titleName = n => /^[A-Z\s.'-]+$/.test(n) ? n.toLowerCase().replace(/(^|[\s'-])([a-z])/g, (a, b, c) => b + c.toUpperCase()) : n;
+function toast(msg, bad) {
+  const t = $('#toast'); t.textContent = msg; t.className = 'toast show' + (bad ? ' bad' : '');
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.className = 'toast', 3800);
+}
+function chunk(arr, n) { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; }
+function csvEscape(v) { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; }
+function download(name, text) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+  a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+function parseCsvText(text) {
+  const rows = []; let row = [], cur = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) { if (ch === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
+    else if (ch === '"') q = true;
+    else if (ch === ',') { row.push(cur); cur = ''; }
+    else if (ch === '\n' || ch === '\r') { if (ch === '\r' && text[i + 1] === '\n') i++; row.push(cur); rows.push(row); row = []; cur = ''; }
+    else cur += ch;
+  }
+  if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+  const clean = rows.filter(r => r.some(c => c.trim() !== ''));
+  if (!clean.length) return [];
+  const head = clean[0].map(h => h.trim());
+  return clean.slice(1).map(r => Object.fromEntries(head.map((h, i) => [h, r[i] ?? ''])));
+}
+async function readSpreadsheet(file) {
+  if (/\.csv$/i.test(file.name)) return parseCsvText(await file.text());
+  const XLSX = await import('https://cdn.jsdelivr.net/npm/xlsx@0.18.5/+esm');
+  const wb = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(ws, { defval: '' });
+}
+
+
+// ---------------------------------------------------------------- Firebase backend
+async function firebaseBackend() {
+  const [{ initializeApp }, A, F] = await Promise.all([
+    import(FB + 'firebase-app.js'), import(FB + 'firebase-auth.js'), import(FB + 'firebase-firestore.js')
+  ]);
+  const app = initializeApp(firebaseConfig);
+  const auth = A.getAuth(app);
+  const db = F.getFirestore(app);
+  const email = () => (auth.currentUser?.email || '').toLowerCase();
+  const list = async (coll, ...wheres) => (await F.getDocs(F.query(F.collection(db, coll), ...wheres.map(([a, b]) => F.where(a, '==', b))))).docs.map(d => ({ id: d.id, ...d.data() }));
+  const batchWrite = async (ops, onProgress) => {
+    let done = 0;
+    for (const part of chunk(ops, 400)) {
+      const b = F.writeBatch(db);
+      part.forEach(([kind, coll, id, data]) => kind === 'set' ? b.set(F.doc(db, coll, id), data) : b.delete(F.doc(db, coll, id)));
+      await b.commit(); done += part.length; onProgress?.(done, ops.length);
+    }
+  };
+  const be = {
+    demo: false,
+    onAuth: cb => A.onAuthStateChanged(auth, u => cb(u ? { email: u.email.toLowerCase(), verified: u.emailVerified } : null)),
+    signIn: (e, p) => A.signInWithEmailAndPassword(auth, e, p),
+    async register(e, p) { const c = await A.createUserWithEmailAndPassword(auth, e, p); await A.sendEmailVerification(c.user); },
+    resendVerify: () => A.sendEmailVerification(auth.currentUser),
+    async refresh() { await A.reload(auth.currentUser); await auth.currentUser.getIdToken(true); return auth.currentUser.emailVerified; },
+    reset: e => A.sendPasswordResetEmail(auth, e),
+    signOut: () => A.signOut(auth),
+
+    async profile() {
+      const e = email();
+      const snap = await F.getDoc(F.doc(db, 'users', e));
+      if (snap.exists()) return snap.data();
+      if (e === OWNER_EMAIL.toLowerCase()) {
+        const p = { email: e, name: 'Frank Pina', role: 'admin', stores: ['*'], canUpload: true };
+        await F.setDoc(F.doc(db, 'users', e), p);
+        return p;
+      }
+      return null;
+    },
+    async meta() { const s = await F.getDoc(F.doc(db, 'config', 'meta')); return s.exists() ? s.data() : { months: [], asOf: {} }; },
+    async goals() { const s = await F.getDoc(F.doc(db, 'config', 'goals')); return s.exists() ? s.data() : DEFAULT_GOALS; },
+    saveGoals: g => F.setDoc(F.doc(db, 'config', 'goals'), g),
+
+    cardsForStore: (month, store) => list('scorecards', ['month', month], ['store', store]),
+    cardsForCid: (month, cid) => list('scorecards', ['month', month], ['cid', cid]),
+    async storeTotal(month, store) { const s = await F.getDoc(F.doc(db, 'storeTotals', `${month}_${slug(store)}`)); return s.exists() ? s.data() : null; },
+
+    // RSA report: one card per consultant for the month. Replaces the month.
+    async publishRsa(p, onProgress) {
+      const now = new Date().toISOString();
+      const ops = [], keep = new Set();
+      for (const x of p.people) {
+        const id = `${p.month}_${x.cid}`; keep.add(id);
+        ops.push(['set', 'scorecards', id, { month: p.month, cid: x.cid, name: x.name, reportName: x.reportName || x.name, title: x.title || 'RSA', store: x.store, k: x.k, hours: x.hours, rank: x.rank || null, from: p.from, asOf: p.to, uploadedAt: now }]);
+      }
+      (await list('scorecards', ['month', p.month])).forEach(d => { if (!keep.has(d.id)) ops.push(['del', 'scorecards', d.id]); });
+      await batchWrite(ops, onProgress);
+      const meta = await be.meta();
+      await F.setDoc(F.doc(db, 'config', 'meta'), { ...meta, months: [...new Set([...(meta.months || []), p.month])].sort().reverse(),
+        asOf: { ...(meta.asOf || {}), [p.month]: p.to }, lastRsa: { by: email(), at: now, file: p.file, people: p.people.length } });
+    },
+    async publishDaily(d) {
+      const now = new Date().toISOString();
+      await batchWrite(d.stores.map(s => ['set', 'storeTotals', `${d.month}_${slug(s.store)}`, { month: d.month, store: s.store, k: s.k, budget: s.budget, vsBudget: s.vsBudget, vsLy: s.vsLy, asOf: d.date, uploadedAt: now }]));
+      const meta = await be.meta();
+      await F.setDoc(F.doc(db, 'config', 'meta'), { ...meta, months: [...new Set([...(meta.months || []), d.month])].sort().reverse(),
+        storeAsOf: { ...(meta.storeAsOf || {}), [d.month]: d.date }, lastDaily: { by: email(), at: now, file: d.file, stores: d.stores.length } });
+    },
+
+    async saveMeta(patch) { const meta = await be.meta(); await F.setDoc(F.doc(db, 'config', 'meta'), { ...meta, ...patch }); },
+    // Consultant directory: RSA name -> store.
+    directory: () => list('consultants'),
+    saveDirectory: rows => batchWrite(rows.map(r => ['set', 'consultants', r.cid, r])),
+    deleteDirectory: cid => F.deleteDoc(F.doc(db, 'consultants', cid)),
+
+    coachingForStore: store => list('coaching', ['store', store]),
+    coachingForCid: cid => list('coaching', ['cid', cid]),
+    teamCoaching: store => list('coaching', ['store', store], ['type', 'team']),
+    saveCoaching: d => F.addDoc(F.collection(db, 'coaching'), { ...d, coach: email() }),
+    deleteCoaching: id => F.deleteDoc(F.doc(db, 'coaching', id)),
+
+    users: async () => (await F.getDocs(F.collection(db, 'users'))).docs.map(d => d.data()),
+    saveUser: u => F.setDoc(F.doc(db, 'users', u.email), u),
+    deleteUser: e => F.deleteDoc(F.doc(db, 'users', e)),
+    saveUsers: list2 => batchWrite(list2.map(u => ['set', 'users', u.email, u]))
+  };
+  return be;
+}
+
+// ---------------------------------------------------------------- Demo backend (in memory, made-up people)
+function demoBackend() {
+  let seed = 11; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const demoStores = ['Tallahassee', 'Thomasville', 'Harahan', 'Outlet Pensacola'];
+  const first = ['Maria', 'Devon', 'Alyssa', 'Marcus', 'Priya', 'Tyler', 'Jasmine', 'Chris', 'Nina', 'Omar', 'Keisha', 'Luis'];
+  const last = ['Alvarez', 'Brooks', 'Chen', 'Dawson', 'Ellis', 'Foster', 'Grant', 'Hayes', 'Ibarra', 'Jordan', 'Kim', 'Lopez'];
+  const people = [];
+  demoStores.forEach((store, si) => {
+    for (let i = 0; i < 6; i++) {
+      const skill = i === 5 && si < 2 ? 0.55 : i === 4 && si === 0 ? 0.68 : 0.8 + rnd() * 0.7;
+      const n = si * 6 + i;   // unique first/last pair for all 24
+      people.push({ name: `${first[n % 12]} ${last[(n * 7 + Math.floor(n / 12)) % 12]}`, store, skill: skill * (store.startsWith('Outlet') ? 0.55 : 1) });
+    }
+  });
+  people.push({ name: 'Jordan Reyes', store: null, skill: 1 });   // new hire nobody has assigned yet
+  const rsaRow = (p, days) => {
+    const hours = days * 5.6 * (0.85 + rnd() * 0.3);
+    const sph = 400 * p.skill * (0.9 + rnd() * 0.2);
+    const pc = (a, b) => (a + rnd() * (b - a)).toFixed(2) + '%';
+    return { 'Sales Associate': p.name, 'Net Sales': (sph * hours).toFixed(2), 'Cancellation %': pc(1, 9), 'Discount %': pc(4, 17),
+      'Credit Apps #': Math.round(days / 30 * 18 * p.skill * (0.6 + rnd() * 0.6)), 'Eff. Margin': pc(53, 59), 'SPH': sph.toFixed(2),
+      'Avg Ticket w. Del.': (1700 + rnd() * 1000).toFixed(2), 'Fin. % of Sales': pc(45, 78), 'Bed. % of Sales': pc(9, 28),
+      'Prot. % of Sales': pc(4, 11), 'Del. % of Sales': pc(5, 10) };
+  };
+  const storeRows = date => demoStores.flatMap(st => {
+    const m = (metric, mtd, bud = '') => ({ report_date: date, segment: st.startsWith('Outlet') ? st.replace('Outlet ', '') + ' Outlet' : st, metric, mtd_ty: String(mtd), mtd_ly: '', mtd_budget: String(bud) });
+    const ns = 250000 + rnd() * 300000;
+    return [m('Net Sales (Stores)', ns.toFixed(2), (-20 + rnd() * 30).toFixed(1)), m('Sales per Guest w. Cancellations', (420 + rnd() * 200).toFixed(2), (-15 + rnd() * 25).toFixed(1)),
+      m('Close Rate', (22 + rnd() * 10).toFixed(1), Math.round(-500 + rnd() * 700)), m('Traffic', Math.round(900 + rnd() * 700), (-10 + rnd() * 15).toFixed(1)),
+      m('Sales per Hour', (330 + rnd() * 150).toFixed(2)), m('Avg Ticket w. Del.', (1900 + rnd() * 600).toFixed(2)), m('Eff. Margin', (54 + rnd() * 4).toFixed(2)),
+      m('Finance % of Sales', (52 + rnd() * 20).toFixed(2)), m('Finance Apps to Traffic', (7 + rnd() * 8).toFixed(2)), m('Bedding % of Sales', (12 + rnd() * 10).toFixed(2)),
+      m('Bedding SPH', (40 + rnd() * 35).toFixed(2)), m('Protection % of Sales', (6 + rnd() * 4).toFixed(2)), m('Protection SPH', (22 + rnd() * 20).toFixed(2)),
+      m('Protection Attachment', (45 + rnd() * 25).toFixed(2)), m('Delivery % of sales', (6 + rnd() * 3).toFixed(2)),
+      m('Cancellations', (-ns * (0.04 + rnd() * 0.06)).toFixed(2)), m('Gross Sales', (ns * 1.08).toFixed(2))];
+  });
+  const augRows = people.filter(p => p.store).map(p => rsaRow(p, 31));
+  people[8].reportName = people[8].name.replace(/^(\w{3})\w+/, '$1');   // a nickname in the report, e.g. "Jas" for Jasmine
+  const sepRows = people.map(p => ({ ...rsaRow(p, 28), 'Sales Associate': p.reportName || p.name }));
+  sepRows.push({ 'Sales Associate': 'HOUSE SALES', 'Net Sales': '900', 'Cancellation %': '0%', 'Discount %': '0%', 'Credit Apps #': '0', 'Eff. Margin': '50%', 'SPH': '0', 'Avg Ticket w. Del.': '0', 'Fin. % of Sales': '0%', 'Bed. % of Sales': '0%', 'Prot. % of Sales': '0%', 'Del. % of Sales': '0%' });
+
+  const cards = {}, totals = {}, dir = {};
+  let meta = { months: [], asOf: {} };
+  let goals = structuredClone(DEFAULT_GOALS);
+  const TITLE = i => (i % 6 === 0 ? 'ASM' : i % 6 === 1 ? 'Sales Lead' : 'RSA');
+  people.filter(p => p.store).forEach((p, i) => { const cid = cidOf(p.name); dir[cid] = { cid, name: p.name, store: p.store, title: TITLE(i), email: p.name.toLowerCase().replace(/[^a-z]/g, '') + '@demo', aliases: [] }; });
+  const users = {
+    'fpina@1915south.com': { email: 'fpina@1915south.com', name: 'Frank Pina', role: 'admin', stores: ['*'], canUpload: true },
+    'director@demo': { email: 'director@demo', name: 'Demo Director', role: 'director', stores: ['Tallahassee', 'Thomasville'], canUpload: false },
+    'exec@demo': { email: 'exec@demo', name: 'Demo Exec', role: 'exec', stores: ['*'] },
+    'leader@demo': { email: 'leader@demo', name: 'Demo Store Leader', role: 'leader', stores: ['Harahan'] },
+    'asm@demo': { email: 'asm@demo', name: people[0].name + ' (ASM, sells and coaches)', role: 'leader', title: 'ASM', stores: ['Tallahassee'], cid: cidOf(people[0].name) },
+    'consultant@demo': { email: 'consultant@demo', name: people[2].name, role: 'consultant', stores: ['Tallahassee'], cid: cidOf(people[2].name) },
+    'low@demo': { email: 'low@demo', name: people[5].name + ' (below minimum)', role: 'consultant', stores: ['Tallahassee'], cid: cidOf(people[5].name) }
+  };
+  let current = 'fpina@1915south.com';
+  const coaching = [];
+  const clone = x => structuredClone(x);
+  const be = {
+    demo: true,
+    sampleFiles: () => [['rsa_report_2026-09-01_to_2026-09-28.csv', sepRows], ['daily-report-2026-09-28.csv', storeRows('2026-09-28')]],
+    onAuth: cb => cb({ email: current, verified: true }),
+    switchUser: e => { current = e; },
+    demoUsers: () => Object.values(users),
+    signOut: async () => toast('Demo mode: nothing to sign out of'),
+    profile: async () => users[current],
+    meta: async () => clone(meta),
+    goals: async () => clone(goals),
+    saveGoals: async g => { goals = clone(g); },
+    cardsForStore: async (m, s) => Object.values(cards).filter(c => c.month === m && c.store === s).map(clone),
+    cardsForCid: async (m, cid) => Object.values(cards).filter(c => c.month === m && c.cid === cid).map(clone),
+    storeTotal: async (m, s) => clone(totals[`${m}_${slug(s)}`] || null),
+    async publishRsa(p) {
+      const keep = new Set();
+      p.people.forEach(x => { const id = `${p.month}_${x.cid}`; keep.add(id); cards[id] = { id, month: p.month, cid: x.cid, name: x.name, reportName: x.reportName || x.name, title: x.title || 'RSA', store: x.store, k: x.k, hours: x.hours, rank: x.rank || null, from: p.from, asOf: p.to }; });
+      Object.keys(cards).forEach(id => { if (cards[id].month === p.month && !keep.has(id)) delete cards[id]; });
+      if (!meta.months.includes(p.month)) meta.months.push(p.month); meta.months.sort().reverse();
+      meta.asOf[p.month] = p.to; meta.lastRsa = { by: current, at: new Date().toISOString(), file: p.file, people: p.people.length };
+    },
+    async publishDaily(d) {
+      d.stores.forEach(s => { totals[`${d.month}_${slug(s.store)}`] = { month: d.month, store: s.store, k: s.k, budget: s.budget, vsBudget: s.vsBudget, vsLy: s.vsLy, asOf: d.date }; });
+      if (!meta.months.includes(d.month)) meta.months.push(d.month); meta.months.sort().reverse();
+      meta.storeAsOf = { ...(meta.storeAsOf || {}), [d.month]: d.date }; meta.lastDaily = { by: current, at: new Date().toISOString(), file: d.file, stores: d.stores.length };
+    },
+    saveMeta: async patch => { meta = { ...meta, ...patch }; },
+    sampleRoster: () => [...people.filter(p => p.store).map((p, i) => ({ Region: 'West', Quartile: '1', Location: p.store === 'Outlet Pensacola' ? 'Pensacola Outlet' : p.store,
+      Role: i % 6 === 0 ? 'Assistant Selling Manager' : i % 6 === 1 ? 'Sales Lead' : 'RSA', Name: p.name, Email: p.name.toLowerCase().replace(/[^a-z]/g, '') + '@demo' })),
+      { Region: 'West', Quartile: '1', Location: 'Harahan', Role: 'Sales Lead', Name: 'OPEN', Email: '' }],
+    directory: async () => Object.values(dir).map(clone),
+    saveDirectory: async rows => rows.forEach(r => { dir[r.cid] = clone(r); }),
+    deleteDirectory: async cid => { delete dir[cid]; },
+    coachingForStore: async st => coaching.filter(x => x.store === st).map(clone),
+    coachingForCid: async cid => coaching.filter(x => x.cid === cid).map(clone),
+    teamCoaching: async st => coaching.filter(x => x.store === st && x.type === 'team').map(clone),
+    saveCoaching: async d => { coaching.push({ ...clone(d), id: 'c' + Date.now(), coach: current }); },
+    deleteCoaching: async id => { const i = coaching.findIndex(x => x.id === id); if (i >= 0) coaching.splice(i, 1); },
+    users: async () => Object.values(users),
+    saveUser: async u => { users[u.email] = u; },
+    deleteUser: async e => { delete users[e]; },
+    saveUsers: async l => l.forEach(u => users[u.email] = u)
+  };
+  // Load August and September the same way a real upload would.
+  const load = (rows, from, to) => {
+    const r = parseRsa(rows);
+    const res = resolveReportNames(r.people, Object.values(dir));
+    const ppl = res.matched.map(({ p, d }) => ({ ...p, cid: d.cid, name: d.name, reportName: p.name, store: d.store, title: d.title })).filter(x => x.store !== SKIP);
+    addRanks(ppl);
+    be.publishRsa({ month: from.slice(0, 7), from, to, people: ppl, file: 'demo' });
+  };
+  load(augRows, '2026-08-01', '2026-08-31');
+  load(sepRows, '2026-09-01', '2026-09-28');
+  const dd = parseDailyReport(storeRows('2026-09-28')); be.publishDaily({ ...dd, file: 'demo' });
+  // one past 1:1 so the follow-up view has something to show
+  const tp = Object.values(cards).find(c => c.month === '2026-09' && c.cid === users['consultant@demo'].cid);
+  const f = pickFocus(tp.k, DEFAULT_GOALS.standard, 0.72).map(x => x.perWeek ? { ...x, value: Math.max(0, x.value - 2) } : { ...x, value: Math.round(x.value * (x.lower ? 1.08 : 0.93) * 10) / 10 });
+  coaching.push({ id: 'seed1', store: tp.store, cid: tp.cid, name: tp.name, coach: 'director@demo', coachName: 'Demo Director',
+    date: '2026-09-22', createdAt: '2026-09-22T15:00:00Z', focus: f,
+    commitment: f.map(x => COACHING[x.key].doThis).join(' '), support: 'I will shadow two of your guests on Saturday.', notes: '' });
+  return be;
+}
+
+// ---------------------------------------------------------------- state
+const S = { sessions: [], coach: null, rolls: {}, be: null, user: null, meta: null, goals: null, month: null, store: null, tab: 'cards', selected: null, pending: null };
+
+const isAdmin = () => S.user?.role === 'admin';
+const seesAll = () => ['admin', 'exec'].includes(S.user?.role) || (S.user?.stores || []).includes('*');
+const canUpload = () => isAdmin() || !!S.user?.canUpload;
+const canCoach = store => isAdmin() || (['director', 'leader'].includes(S.user?.role) && ((S.user.stores || []).includes('*') || (S.user.stores || []).includes(store)));
+const ALL_STORE_NAMES = STORES.map(s => s.name);
+const myStores = () => {
+  if (seesAll()) return ALL_STORE_NAMES;
+  const mine = (S.user?.stores || []).filter(s => s !== '*');
+  return ALL_STORE_NAMES.filter(s => mine.includes(s));
+};
+// Store dropdown grouped by district, in STORIS store-number order.
+function storeOptions(list, selected, extra = '') {
+  const groups = {};
+  list.forEach(n => { const st = STORES.find(x => x.name === n); if (st) (groups[st.district] ||= []).push(st); });
+  return extra + Object.entries(groups).map(([k, arr]) => `<optgroup label="${esc(DISTRICTS[k] || 'Other')}">${arr.map(st =>
+    `<option value="${esc(st.name)}" ${st.name === selected ? 'selected' : ''}>${esc(st.name)} (${st.id})</option>`).join('')}</optgroup>`).join('');
+}
+
+// ---------------------------------------------------------------- boot
+async function boot() {
+  try {
+    S.be = DEMO ? demoBackend() : await firebaseBackend();
+  } catch (e) {
+    $('#app').innerHTML = `<div class="panel narrow"><h2>Could not load</h2><p>${esc(e.message)}</p></div>`; return;
+  }
+  if (DEMO) {
+    $('#demoBar').hidden = false;
+    $('#demoRole').innerHTML = S.be.demoUsers().map(u => `<option value="${esc(u.email)}">${esc(roleLabel(u.role))}: ${esc(u.name)}</option>`).join('');
+  }
+  S.be.onAuth(async u => {
+    if (!u) return renderSignIn();
+    if (!u.verified) return renderVerify(u.email);
+    try { S.user = await S.be.profile(); } catch (e) { S.user = null; }
+    if (!S.user) return renderNotRostered(u.email);
+    await loadShared();
+    renderShell();
+  });
+}
+
+async function loadShared() {
+  [S.meta, S.goals] = await Promise.all([S.be.meta(), S.be.goals()]);
+  S.goals = { ...DEFAULT_GOALS, ...S.goals, standard: { ...DEFAULT_GOALS.standard, ...(S.goals?.standard || {}) } };
+  if (!S.goals.outletStores?.length) S.goals.outletStores = OUTLETS;
+  if (!S.month || !S.meta.months.includes(S.month)) S.month = S.meta.months[0] || null;
+  const stores = myStores();
+  if (!S.store || !stores.includes(S.store)) S.store = stores[0] || null;
+}
+// ---------------------------------------------------------------- auth screens
+function renderSignIn(msg = '') {
+  $('#who').innerHTML = '';
+  $('#app').innerHTML = `
+  <form class="panel narrow" id="signin">
+    <h2>Sign in</h2>
+    <p class="muted">Use your work email. First time here? Enter your email, choose a password, and tap Create account. You will get a verification email.</p>
+    <label>Email<input type="email" id="em" autocomplete="username" required></label>
+    <label>Password<input type="password" id="pw" autocomplete="current-password" minlength="8" required></label>
+    ${msg ? `<p class="err">${esc(msg)}</p>` : ''}
+    <div class="row">
+      <button class="btn primary" type="submit">Sign in</button>
+      <button class="btn" type="button" id="reg">Create account</button>
+      <button class="link" type="button" id="forgot">Forgot password</button>
+    </div>
+  </form>`;
+  const em = () => $('#em').value.trim().toLowerCase(), pw = () => $('#pw').value;
+  $('#signin').onsubmit = async e => { e.preventDefault(); try { await S.be.signIn(em(), pw()); } catch (x) { renderSignIn(friendly(x)); } };
+  $('#reg').onclick = async () => {
+    if (!em() || pw().length < 8) return renderSignIn('Enter your email and a password of at least 8 characters.');
+    try { await S.be.register(em(), pw()); } catch (x) { renderSignIn(friendly(x)); }
+  };
+  $('#forgot').onclick = async () => {
+    if (!em()) return renderSignIn('Type your email first, then tap Forgot password.');
+    try { await S.be.reset(em()); toast('Password reset email sent.'); } catch (x) { renderSignIn(friendly(x)); }
+  };
+}
+function friendly(x) {
+  const c = x?.code || '';
+  if (c.includes('invalid-credential') || c.includes('wrong-password') || c.includes('user-not-found')) return 'Email or password is not right. New here? Tap Create account.';
+  if (c.includes('email-already-in-use')) return 'That email already has an account. Sign in, or tap Forgot password.';
+  if (c.includes('weak-password')) return 'Password needs at least 8 characters.';
+  if (c.includes('too-many-requests')) return 'Too many tries. Wait a few minutes and try again.';
+  return x?.message || 'Something went wrong.';
+}
+function renderVerify(email) {
+  $('#who').innerHTML = signOutBtn();
+  $('#app').innerHTML = `
+  <div class="panel narrow">
+    <h2>Check your email</h2>
+    <p>We sent a verification link to <b>${esc(email)}</b>. Open it, then come back and tap Continue. Check junk mail if you do not see it.</p>
+    <div class="row"><button class="btn primary" id="cont">Continue</button><button class="btn" id="again">Send it again</button></div>
+  </div>`;
+  wireSignOut();
+  $('#cont').onclick = async () => { if (await S.be.refresh()) location.reload(); else toast('Not verified yet. Open the link in the email first.', true); };
+  $('#again').onclick = async () => { try { await S.be.resendVerify(); toast('Sent.'); } catch (x) { toast(friendly(x), true); } };
+}
+function renderNotRostered(email) {
+  $('#who').innerHTML = signOutBtn();
+  $('#app').innerHTML = `
+  <div class="panel narrow">
+    <h2>You are signed in, but not on the roster yet</h2>
+    <p><b>${esc(email)}</b> has not been given access. Ask your director or Frank Pina to add this email, then refresh.</p>
+  </div>`;
+  wireSignOut();
+}
+const signOutBtn = () => `<button class="link light" id="so">Sign out</button>`;
+function wireSignOut() { const b = $('#so'); if (b) b.onclick = () => S.be.signOut(); }
+
+// ---------------------------------------------------------------- shell
+function renderShell() {
+  const u = S.user;
+  $('#who').innerHTML = `<span>${esc(u.name || u.email)} <small>${esc(roleLabel(u.role))}</small></span>${DEMO ? '' : signOutBtn()}`;
+  wireSignOut();
+  const tabs = [['cards', u.role === 'consultant' ? 'My scorecard' : 'Scorecards']];
+  if (u.role !== 'consultant' && u.cid) tabs.push(['mine', 'My scorecard']);
+  if (canUpload()) tabs.push(['upload', 'Upload'], ['directory', 'Consultants']);
+  if (isAdmin()) tabs.push(['roster', 'Logins'], ['goals', 'Goals']);
+  if (!tabs.some(t => t[0] === S.tab)) S.tab = 'cards';
+  $('#app').innerHTML = `
+    <nav class="tabs">${tabs.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}">${l}</button>`).join('')}</nav>
+    <div id="view"></div>`;
+  document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; S.selected = null; renderShell(); });
+  ({ cards: viewCards, mine: viewMineTab, upload: viewUpload, directory: viewDirectory, roster: viewRoster, goals: viewGoals })[S.tab]();
+}
+
+// ---------------------------------------------------------------- scorecards
+function pickers(mine = false) {
+  const months = S.meta.months || [];
+  const showStore = S.user.role !== 'consultant' && !mine;
+  const asOf = S.meta.asOf?.[S.month], sAsOf = S.meta.storeAsOf?.[S.month];
+  return `<div class="pickers">
+    <label>Month<select id="pm">${months.map(m => `<option value="${m}" ${m === S.month ? 'selected' : ''}>${monthLabel(m)}</option>`).join('')}</select></label>
+    ${showStore ? `<label>Store<select id="ps">${storeOptions(myStores(), S.store)}</select></label>` : ''}
+    <div class="asof">${asOf ? `Consultants through <b>${dateLabel(asOf)}</b>` : ''}${sAsOf ? `<br>Stores through <b>${dateLabel(sAsOf)}</b>` : ''}</div>
+  </div>`;
+}
+function wirePickers() {
+  const pm = $('#pm'), ps = $('#ps');
+  if (pm) pm.onchange = () => { S.month = pm.value; S.selected = null; S.tab === 'mine' ? viewMineTab() : viewCards(); };
+  if (ps) ps.onchange = () => { S.store = ps.value; S.selected = null; viewCards(); };
+}
+const daysAgo = iso => Math.floor((Date.now() - new Date(iso + (iso.length === 10 ? 'T12:00:00' : '')).getTime()) / 86400000);
+const todayIso = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const byNewest = (a, b) => (b.createdAt || '').localeCompare(a.createdAt || '');
+const metricBy = key => METRICS.find(m => m.key === key);
+const prevMonth = m => monthsBack(m, 1)[1];
+
+async function viewCards() {
+  const v = $('#view');
+  if (!S.month) {
+    v.innerHTML = `<div class="panel"><h2>No data yet</h2><p>${canUpload() ? 'Go to Upload and drop in this week\'s two files.' : 'Scorecards show up here once the first files are uploaded.'}</p></div>`;
+    return;
+  }
+  v.innerHTML = pickers() + `<div class="loading">Loading…</div>`;
+  wirePickers();
+  try {
+    if (S.user.role === 'consultant') return await viewMine(v);
+    if (!S.store) { v.innerHTML = pickers() + `<div class="panel"><p>No stores assigned to you yet. Ask Frank to add your stores.</p></div>`; wirePickers(); return; }
+    const [cards, total, sessions, prev] = await Promise.all([
+      S.be.cardsForStore(S.month, S.store), S.be.storeTotal(S.month, S.store),
+      S.be.coachingForStore(S.store).catch(() => []), S.be.cardsForStore(prevMonth(S.month), S.store).catch(() => [])
+    ]);
+    sessions.sort(byNewest);
+    S.sessions = sessions;
+    S.rolls = {};
+    cards.forEach(c => { S.rolls[c.id] = rollFor(c, prev.find(p => p.cid === c.cid)); });
+    cards.sort((a, b) => b.k.netSales - a.k.netSales);
+    const g = goalsFor(S.goals, S.store);
+    const pace = paceFactor(S.meta.asOf?.[S.month]);
+    const minSph = minSphFor(S.goals, S.store);
+    const below = cards.filter(c => S.rolls[c.id].st === 'below'), watch = cards.filter(c => S.rolls[c.id].st === 'watch');
+    const sel = cards.find(c => c.id === S.selected);
+    const lastCell = cid => {
+      const l = sessions.find(x => !isTeam(x) && x.cid === cid);
+      if (!l) return `<td><span class="due">No 1:1 yet</span></td>`;
+      const d = daysAgo(l.date);
+      return `<td>${d > 7 ? `<span class="due">${d} days ago</span>` : `<span class="ok">${d === 0 ? 'Today' : d + ' days ago'}</span>`}</td>`;
+    };
+    v.innerHTML = pickers()
+      + (below.length || watch.length ? `<div class="panel minpanel">
+          <h2>Minimum standard: $${minSph} rolling SPH</h2>
+          ${below.length ? `<p class="minrow"><span class="flag below">Below minimum</span> ${below.map(c => `<button class="link" data-jump="${esc(c.id)}">${esc(titleName(c.name))} ($${Math.round(S.rolls[c.id].sph)})</button>`).join(', ')}</p>` : ''}
+          ${watch.length ? `<p class="minrow"><span class="flag watch">Within 10%</span> ${watch.map(c => `<button class="link" data-jump="${esc(c.id)}">${esc(titleName(c.name))} ($${Math.round(S.rolls[c.id].sph)})</button>`).join(', ')}</p>` : ''}
+        </div>` : '')
+      + (total ? storeCard(total) + `<div id="teamcoach">${coachPanel('team', total)}</div>` : `<div class="panel"><p class="muted">No store report on file for ${esc(S.store)} in ${monthLabel(S.month)} yet.</p></div>`)
+      + (cards.length ? `<div class="panel flush">
+        <div class="panel-head"><h2>Consultants <span class="count">${cards.length}</span></h2><span class="muted small">Tap a name to open their card and weekly 1:1. Sorted by net sales.</span></div>
+        <div class="scroller"><table class="grid">
+          <thead><tr><th>Consultant</th><th>Last 1:1</th><th class="num">Rolling SPH</th>${METRICS.map(m => `<th class="num">${esc(m.label)}</th>`).join('')}</tr>
+          <tr class="goalrow"><td>Goal${pace < 1 ? ` <small>(monthly totals paced to ${Math.round(pace * 100)}%)</small>` : ''}</td><td></td><td class="num">min $${minSph}</td>${METRICS.map(m => `<td class="num">${fmtGoal(m, m.monthly ? g[m.key] * pace : g[m.key])}</td>`).join('')}</tr></thead>
+          <tbody>${cards.map(c => `<tr data-id="${esc(c.id)}" class="${c.id === S.selected ? 'sel' : ''}"><td class="nm">${esc(titleName(c.name))}${c.title && c.title !== 'RSA' ? `<small>${esc(c.title)}</small>` : ''}</td>${lastCell(c.cid)}${rollCell(S.rolls[c.id])}${METRICS.map(m => {
+              const st = status(m, c.k[m.key], g[m.key], pace);
+              return `<td class="num"><span class="val ${st}">${fmt(m, c.k[m.key])}</span></td>`;
+            }).join('')}</tr>`).join('')}</tbody>
+        </table></div></div>` : `<div class="panel"><p class="muted">No consultants on file for ${esc(S.store)} in ${monthLabel(S.month)}. ${canUpload() ? 'If people are missing, check the Consultants tab to make sure they are assigned to this store.' : ''}</p></div>`)
+      + (sel ? minBanner(sel, S.rolls[sel.id], false) + consultantCard(sel) + `<div id="coach">${coachPanel('one', sel)}</div>` : '');
+    wirePickers();
+    v.querySelectorAll('[data-jump]').forEach(b => b.onclick = () => v.querySelector(`tr[data-id="${CSS.escape(b.dataset.jump)}"]`)?.click());
+    v.querySelectorAll('tbody tr[data-id]').forEach(tr => tr.onclick = () => {
+      S.selected = S.selected === tr.dataset.id ? null : tr.dataset.id; if (S.cstate) S.cstate.one = null;
+      viewCards().then(() => { const d = $('#min-' + CSS.escape(S.selected || '')) || $('#detail-' + CSS.escape(S.selected || '')); d?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+    });
+    if (sel) wireCoach('one', sel);
+    if (total) wireCoach('team', total);
+  } catch (e) {
+    v.innerHTML = pickers() + `<div class="panel"><p class="err">Could not load scorecards: ${esc(e.message)}</p></div>`; wirePickers();
+  }
+}
+
+async function viewMine(v) {
+  const cid = S.user.cid;
+  const [cards, prev, sessions] = await Promise.all([S.be.cardsForCid(S.month, cid), S.be.cardsForCid(prevMonth(S.month), cid).catch(() => []), S.be.coachingForCid(cid).catch(() => [])]);
+  sessions.sort(byNewest);
+  const c = cards[0];
+  if (!c) { v.innerHTML = pickers(true) + `<div class="panel"><p>No sales on file for you in ${monthLabel(S.month)} yet.</p></div>`; wirePickers(); return; }
+  const [total, team] = await Promise.all([S.be.storeTotal(S.month, c.store).catch(() => null), S.be.teamCoaching(c.store).catch(() => [])]);
+  team.sort(byNewest);
+  v.innerHTML = pickers(true) + minBanner(c, rollFor(c, prev[0]), true) + myFocus(c, sessions.filter(x => !isTeam(x))[0]) + teamFocus(total, team[0])
+    + consultantCard(c) + (total ? storeCard(total) : '');
+  wirePickers();
+}
+// Selling leaders (ASM, Sales Lead) with their own card.
+async function viewMineTab() {
+  const v = $('#view');
+  if (!S.month) { v.innerHTML = `<div class="panel"><p>No data yet.</p></div>`; return; }
+  v.innerHTML = pickers(true) + `<div class="loading">Loading…</div>`;
+  try { await viewMine(v); } catch (e) { v.innerHTML = pickers(true) + `<div class="panel"><p class="err">Could not load: ${esc(e.message)}</p></div>`; }
+}
+
+// ---------------------------------------------------------------- minimum standard
+function rollFor(c, prev) {
+  const r = rollingSph(c, prev);
+  const min = minSphFor(S.goals, c.store);
+  return { ...r, min, st: minStatus(r.sph, min) };
+}
+function rollCell(r) {
+  if (!r || r.sph === null) return `<td class="num">--</td>`;
+  const cls = r.st === 'below' ? 'red' : r.st === 'watch' ? 'amber' : 'green';
+  return `<td class="num"><span class="val ${cls}">$${Math.round(r.sph).toLocaleString('en-US')}</span>${r.st === 'below' ? '<small class="flagtxt">Below min</small>' : ''}</td>`;
+}
+function minBanner(c, r, own) {
+  if (!r || r.sph === null || r.st === 'ok' || r.st === 'none') return '';
+  const who = own ? 'Your' : `${esc(titleName(c.name).split(' ')[0])}'s`;
+  const range = `${dateLabel(r.from)} to ${dateLabel(r.to)}, ${r.days} days`;
+  const outlet = isOutlet(S.goals, c.store) ? ' for outlets' : '';
+  if (r.st === 'below') return `<div class="minbanner below" id="min-${esc(c.id)}"><b>Below minimum standard.</b> ${who} rolling sales per hour is <b>$${Math.round(r.sph)}</b>. The minimum is $${r.min}${outlet}. <span class="small">(Last month plus this month: ${range}, $${Math.round(r.sales).toLocaleString('en-US')} over ${Math.round(r.hours)} hours.)</span>${own ? ' Talk with your leader this week about a plan.' : ' Address this in the 1:1 this week.'}</div>`;
+  return `<div class="minbanner watch" id="min-${esc(c.id)}"><b>Close to minimum.</b> ${who} rolling sales per hour is <b>$${Math.round(r.sph)}</b>, within 10% of the $${r.min} minimum. <span class="small">(${range}.)</span></div>`;
+}
+
+// ---------------------------------------------------------------- cards
+function consultantCard(c) {
+  const g = goalsFor(S.goals, c.store);
+  const pace = paceFactor(c.asOf);
+  const r = c.rank;
+  const rk = (scope, key) => { const x = r?.[scope]?.[key]; return x ? `#${x[0]} of ${x[1]}` : ''; };
+  const headline = r?.store?.netSales
+    ? `<div class="rankline"><span class="rk"><b>${rk('store', 'netSales')}</b> in ${esc(c.store)}</span><span class="rk"><b>${rk('company', 'netSales')}</b> company-wide</span><span class="muted small">Net sales rank</span></div>` : '';
+  return `<section class="panel card" id="detail-${esc(c.id)}">
+    <div class="card-head">
+      <div><p class="eyebrow">${esc(c.store)}</p><h2 class="big">${esc(titleName(c.name))}</h2></div>
+      <div class="muted small">MTD ${dateLabel(c.from)} to ${dateLabel(c.asOf)} · about ${Math.round(c.hours)} hours</div>
+    </div>
+    ${headline}
+    <div class="tiles">${METRICS.map(m => {
+      const v = c.k[m.key], goal = g[m.key];
+      const st = status(m, v, goal, pace);
+      const goalTxt = goal == null ? 'No goal set' : m.monthly ? `${fmtGoal(m, goal)}/mo · pace ${fmtGoal(m, goal * pace)}` : `${m.lower ? 'At or under ' : 'Goal '}${fmtGoal(m, goal)}`;
+      return `<div class="tile ${st}"><div class="tl">${esc(m.label)}</div><div class="tv">${fmt(m, v)}</div><div class="tg">${goalTxt}</div>${r?.store?.[m.key] ? `<div class="tr">${rk('store', m.key)} store · ${rk('company', m.key)} company</div>` : ''}</div>`;
+    }).join('')}</div>
+  </section>`;
+}
+
+function storeCard(t) {
+  const g = goalsFor(S.goals, t.store);
+  const sign = x => (x > 0 ? '+' : '') + x;
+  return `<section class="panel card store">
+    <div class="card-head">
+      <div><p class="eyebrow">Store total · from the daily report</p><h2 class="big">${esc(t.store)}</h2></div>
+      <div class="muted small">MTD through ${dateLabel(t.asOf)}</div>
+    </div>
+    <div class="tiles">${STORE_METRICS.map(m => {
+      const v = t.k?.[m.key];
+      const bud = t.budget?.[m.key], vb = t.vsBudget?.[m.key], ly = t.vsLy?.[m.key];
+      let goal = bud ?? g[m.key] ?? null, goalTxt;
+      if (bud != null) goalTxt = `Budget ${fmtGoal(m, bud)} (${m.budget === 'bps' ? sign(vb) + ' bps' : sign(vb) + '%'})`;
+      else if (g[m.key] != null) goalTxt = `${m.lower ? 'At or under ' : 'Goal '}${fmtGoal(m, g[m.key])}`;
+      else goalTxt = m.key === 'traffic' ? 'Guests counted' : '';
+      const st = m.key === 'traffic' && bud == null ? 'none' : status(m, v, goal);
+      return `<div class="tile ${st} ${m.key === 'spg' ? 'hero' : ''}"><div class="tl">${esc(m.label)}</div><div class="tv">${fmt(m, v)}</div><div class="tg">${goalTxt}</div>${ly != null ? `<div class="tr">${sign(ly)}% vs LY</div>` : ''}</div>`;
+    }).join('')}</div>
+  </section>`;
+}
+// ---------------------------------------------------------------- talk to text
+// Uses the browser's built-in speech recognition (Chrome, Edge, Safari). Nothing is recorded
+// or saved as audio; only the words land in the box.
+const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, recBtn = null;
+const micBtn = id => Speech ? `<button type="button" class="mic" data-mic="${id}" aria-label="Talk to text"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg><span>Talk</span></button>` : '';
+function stopMic() { if (rec) { try { rec.stop(); } catch (e) {} } }
+function wireMics(root) {
+  root.querySelectorAll('[data-mic]').forEach(b => b.onclick = () => {
+    if (rec && recBtn === b) return stopMic();
+    stopMic();
+    const box = $('#' + b.dataset.mic);
+    const live = b.parentElement.querySelector('.live');
+    rec = new Speech(); recBtn = b;
+    rec.lang = 'en-US'; rec.continuous = true; rec.interimResults = true;
+    rec.onresult = e => {
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript.trim();
+        if (e.results[i].isFinal) {
+          const cur = box.value.replace(/\s+$/, '');
+          const said = t.charAt(0).toUpperCase() + t.slice(1);
+          box.value = (cur ? cur + (/[.!?]$/.test(cur) ? ' ' : '. ') : '') + said;
+        } else interim += t + ' ';
+      }
+      if (live) live.textContent = interim;
+    };
+    rec.onerror = e => {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') toast('Microphone is blocked. Allow it for this site in your browser settings, then tap Talk again.', true);
+      else if (e.error === 'no-speech') toast('Did not hear anything. Tap Talk and try again.', true);
+      else if (e.error !== 'aborted') toast('Talk to text stopped: ' + e.error, true);
+    };
+    rec.onend = () => { b.classList.remove('on'); b.querySelector('span').textContent = 'Talk'; if (live) live.textContent = ''; rec = null; recBtn = null; };
+    try { rec.start(); b.classList.add('on'); b.querySelector('span').textContent = 'Stop'; box.focus(); }
+    catch (x) { toast('Could not start talk to text.', true); rec = null; }
+  });
+}
+
+// ---------------------------------------------------------------- weekly coaching: 1:1 and team
+// mode 'one' = a consultant's weekly 1:1 (consultant card metrics)
+// mode 'team' = the store's weekly team coaching (store total metrics from the daily report)
+const MODES = {
+  one: { box: 'coach', p: 'cf', list: METRICS, word: '1:1' },
+  team: { box: 'teamcoach', p: 'tf', list: STORE_METRICS.filter(m => TEAM_FOCUS.includes(m.key)), word: 'team session' }
+};
+const mBy = (mode, key) => MODES[mode].list.find(m => m.key === key) || STORE_METRICS.find(m => m.key === key) || metricBy(key);
+const isTeam = x => x.type === 'team';
+
+// Goal for one metric in this mode (monthly metrics are paced; team uses the store budget when there is one).
+function goalOf(mode, subj, key) {
+  const g = goalsFor(S.goals, subj.store), m = mBy(mode, key);
+  if (mode === 'team') return subj.budget?.[key] ?? g[key];
+  return m.monthly ? g[key] * paceFactor(subj.asOf) : g[key];
+}
+function focusItem(mode, subj, key) {
+  const m = mBy(mode, key), v = subj.k?.[key], goal = goalOf(mode, subj, key);
+  const g = goalsFor(S.goals, subj.store);
+  const x = { key, label: m.label, value: v, goal, lower: !!m.lower, ratio: m.lower ? (v ? goal / v : 2) : v / goal, perWeek: mode === 'one' && m.monthly ? Math.ceil(g[key] / 4.33) : null };
+  return { ...x, target: weeklyTarget(x) };
+}
+
+// How each focus item from a past session has moved since.
+function followUp(mode, session, k) {
+  return (session.focus || []).map(f => {
+    const m = mBy(mode, f.key); const cur = k?.[f.key];
+    let st = 'none', word = 'No data';
+    if (daysAgo(session.date) < 1) { st = 'none'; word = 'Set today'; }
+    else if (cur !== null && cur !== undefined) {
+      if (f.perWeek) { const gained = cur - f.value; st = gained >= f.target ? 'green' : gained > 0 ? 'amber' : 'red'; word = `${Math.round(gained)} since then (aim ${f.target})`; }
+      else if (f.lower) { st = cur <= f.target ? 'green' : cur < f.value ? 'amber' : 'red'; word = st === 'green' ? 'Hit target' : st === 'amber' ? 'Coming down' : 'Not moving yet'; }
+      else { st = cur >= f.target ? 'green' : cur > f.value ? 'amber' : 'red'; word = st === 'green' ? 'Hit target' : st === 'amber' ? 'Moving up' : 'Not moving yet'; }
+    }
+    return `<div class="fu ${st}"><div><b>${esc(m.label)}</b><div class="small muted">${f.perWeek ? `Was ${fmt(m, f.value)} MTD` : `${fmt(m, f.value)} then · target ${fmt(m, f.target)}`}</div></div>
+      <div class="fu-now"><span class="val ${st}">${fmt(m, cur)}</span><div class="small">${esc(word)}</div></div></div>`;
+  }).join('');
+}
+
+function coachPanel(mode, subj) {
+  const M = MODES[mode], team = mode === 'team';
+  const sessions = (S.sessions || []).filter(x => team ? isTeam(x) : !isTeam(x) && x.cid === subj.cid);
+  const last = sessions[0];
+  const own = !team && S.user.cid && subj.cid === S.user.cid;
+  const coachable = canCoach(subj.store) && !own;
+  const key = team ? 'team:' + subj.store + subj.asOf : subj.id;
+  S.cstate ||= {};
+  if (!S.cstate[mode] || S.cstate[mode].id !== key) {
+    let picks = team ? pickStoreFocus(subj, goalsFor(S.goals, subj.store)).map(p => p.key)
+      : pickFocus(subj.k, goalsFor(S.goals, subj.store), paceFactor(subj.asOf)).map(p => p.key);
+    // Below the minimum standard: SPH is always focus #1.
+    if (!team && S.rolls?.[subj.id]?.st === 'below') picks = ['sph', ...picks.filter(k => k !== 'sph')].slice(0, 2);
+    S.cstate[mode] = { id: key, suggested: picks, selected: [...picks] };
+  }
+  const st = S.cstate[mode];
+  const items = st.selected.map(k => focusItem(mode, subj, k));
+  const others = M.list.filter(m => COACHING[m.key] && !st.selected.includes(m.key) && subj.k?.[m.key] != null);
+  const first = team ? 'the team' : titleName(subj.name).split(' ')[0];
+  const who = team ? 'The team' : first;
+  const n = last ? 1 : 0;
+  if (own) return `<section class="panel coach"><p class="eyebrow">Weekly 1:1</p><p>This is your own card. Your 1:1 is run by your leader.</p>
+    ${last ? `<div class="fus">${followUp(mode, last, subj.k)}</div>` : ''}</section>`;
+  return `<section class="panel coach ${team ? 'team' : ''}">
+    <div class="card-head"><div><p class="eyebrow">${team ? 'Weekly team coaching' : 'Weekly 1:1'}</p><h2 class="big">${team ? `Coaching the ${esc(subj.store)} team` : `Coaching ${esc(first)}`}</h2></div>
+      <div class="muted small">${last ? `Last ${M.word} ${dateLabel(last.date)} with ${esc(last.coachName || last.coach)}` : `No ${M.word} on file yet`}</div></div>
+    ${team ? `<p class="small muted">Use this for the weekly team meeting or huddle. Same rule: no more than 2 things. The team sees this plan on their own cards.</p>` : ''}
+
+    ${last ? `<h3>1. Follow up on last week</h3>
+      <p class="small">${team ? 'The team' : 'They'} committed to: <i>${esc(last.commitment || 'nothing recorded')}</i></p>
+      <div class="fus">${followUp(mode, last, subj.k)}</div>
+      <p class="small muted">Start here. Ask what ${team ? 'the team' : 'they'} did, what worked, and what got in the way.</p>` : ''}
+
+    <h3>${n + 1}. This week's focus <span class="muted small">(no more than 2)</span></h3>
+    <div class="focus">${items.map((x, i) => {
+      const t = COACHING[x.key]; const m = mBy(mode, x.key); const sug = st.suggested.includes(x.key);
+      const goalWord = team && subj.budget?.[x.key] != null ? 'budget' : 'goal';
+      return `<div class="fcard">
+        <div class="fhead"><span class="fnum">${i + 1}</span><div><b>${esc(x.label)}</b> <span class="pill">${esc(t.pillar)}</span>${!team && x.key === 'sph' && S.rolls?.[subj.id]?.st === 'below' ? ' <span class="pill minp">Minimum standard</span>' : ''}${sug ? '' : ' <span class="pill alt">Leader pick</span>'}
+          <div class="small muted">Now ${fmt(m, x.value)} · ${goalWord} ${fmt(m, x.goal)} · ${x.perWeek ? `this week: ${x.perWeek}` : `target by next week: ${fmt(m, x.target)}`}</div></div>
+          ${coachable ? `<button class="link small" data-drop="${x.key}">Remove</button>` : ''}</div>
+        <p class="small">${esc(t.why)}</p>
+        <div class="small"><b>${team ? 'Ask the team' : 'Ask'}</b><ul>${t.ask.map(q => `<li>${esc(q)}</li>`).join('')}</ul></div>
+        <div class="small"><b>This week</b> ${esc(t.doThis)}</div>
+      </div>`;
+    }).join('') || `<p class="muted">Pick one or two areas below.</p>`}</div>
+    ${coachable && others.length ? `<div class="swap"><span class="small muted">${st.selected.length >= 2 ? 'Remove one to pick something else:' : 'Add a focus:'}</span>
+      ${others.map(m => `<button class="chip" data-add="${m.key}" ${st.selected.length >= 2 ? 'disabled' : ''}>${esc(m.label)}</button>`).join('')}</div>` : ''}
+
+    ${coachable ? `<h3>${n + 2}. Agree on the plan</h3>
+    <form id="${M.p}Form" class="cform">
+      <div class="fieldhead"><label for="${M.p}_commit">What ${esc(team ? 'the team' : first)} will do this week</label>${micBtn(M.p + '_commit')}<span class="live"></span></div>
+      <textarea id="${M.p}_commit" rows="3" required>${esc(items.map(x => COACHING[x.key].doThis).join(' '))}</textarea>
+      <div class="fieldhead"><label for="${M.p}_support">${team ? 'How leaders will follow up' : 'How you will help'}</label>${micBtn(M.p + '_support')}<span class="live"></span></div>
+      <textarea id="${M.p}_support" rows="2" placeholder="${team ? 'Example: Leaders check apps at every huddle and shadow one guest each per shift.' : 'Example: I will shadow two of your guests Saturday.'}"></textarea>
+      <div class="fieldhead"><label for="${M.p}_notes">Notes <small>${team ? 'the team can see these' : esc(first) + ' can see these'}</small></label>${micBtn(M.p + '_notes')}<span class="live"></span></div>
+      <textarea id="${M.p}_notes" rows="3" placeholder="Tap Talk and say what you covered."></textarea>
+      ${Speech ? '' : '<p class="small muted">Talk to text is not supported in this browser. Use Chrome, Edge or Safari, or the mic on your keyboard.</p>'}
+      <div class="row"><button class="btn primary" ${items.length ? '' : 'disabled'}>Save ${M.word}</button><span class="small muted">Saves the focus, the numbers as of today, and the plan. Next week this opens with the follow-up.</span></div>
+    </form>` : ''}
+
+    ${sessions.length ? `<details class="hist"><summary>Past ${team ? 'team sessions' : '1:1s'} (${sessions.length})</summary>${sessions.map(x => `
+      <div class="hrow"><div><b>${dateLabel(x.date)}</b> · ${esc(x.coachName || x.coach)}<div class="small">${(x.focus || []).map(f => esc(f.label)).join(' + ')}</div></div>
+      <div class="small">${esc(x.commitment || '')}${x.support ? `<div class="muted">Leader: ${esc(x.support)}</div>` : ''}${x.notes ? `<div class="muted">Notes: ${esc(x.notes)}</div>` : ''}</div>
+      ${isAdmin() || x.coach === S.user.email ? `<button class="link danger small" data-delc="${esc(x.id)}">Delete</button>` : '<span></span>'}</div>`).join('')}</details>` : ''}
+  </section>`;
+}
+
+function wireCoach(mode, subj) {
+  const M = MODES[mode], team = mode === 'team';
+  const box = $('#' + M.box); if (!box) return;
+  wireMics(box);
+  const st = () => S.cstate[mode];
+  const rerender = () => {
+    stopMic();
+    const keep = ['_support', '_notes'].map(s => [M.p + s, $('#' + M.p + s)?.value || '']);
+    box.innerHTML = coachPanel(mode, subj); wireCoach(mode, subj);
+    keep.forEach(([id, v]) => { const el = $('#' + id); if (el && v) el.value = v; });
+  };
+  box.querySelectorAll('[data-drop]').forEach(b => b.onclick = () => { st().selected = st().selected.filter(k => k !== b.dataset.drop); rerender(); });
+  box.querySelectorAll('[data-add]').forEach(b => b.onclick = () => {
+    if (st().selected.length >= 2) return toast('Keep it to 2. Remove one first.', true);
+    st().selected.push(b.dataset.add); rerender();
+  });
+  box.querySelectorAll('[data-delc]').forEach(b => b.onclick = async () => {
+    if (b.dataset.confirm !== '1') { b.dataset.confirm = '1'; b.textContent = 'Tap again to delete'; return; }
+    await S.be.deleteCoaching(b.dataset.delc); toast('Deleted.'); viewCards();
+  });
+  const f = $('#' + M.p + 'Form');
+  if (f) f.onsubmit = async e => {
+    e.preventDefault(); stopMic();
+    const focus = st().selected.map(k => { const x = focusItem(mode, subj, k); return { key: k, label: x.label, value: x.value, goal: Math.round(x.goal * 10) / 10, target: x.target, perWeek: x.perWeek, lower: x.lower }; });
+    const base = { store: subj.store, coachName: S.user.name || S.user.email, date: todayIso(), createdAt: new Date().toISOString(), focus,
+      commitment: $('#' + M.p + '_commit').value.trim(), support: $('#' + M.p + '_support').value.trim(), notes: $('#' + M.p + '_notes').value.trim() };
+    try {
+      await S.be.saveCoaching(team ? { ...base, type: 'team' } : { ...base, type: 'one', cid: subj.cid, name: subj.name });
+      toast(team ? 'Team session saved.' : `1:1 with ${titleName(subj.name).split(' ')[0]} saved.`);
+      S.cstate[mode] = null; viewCards();
+    } catch (x) { toast('Could not save: ' + x.message, true); }
+  };
+}
+
+// Consultant's own view: their latest 1:1 plan, and the store's team plan.
+function myFocus(c, session) {
+  if (!session) return '';
+  return `<section class="panel coach mine">
+    <div class="card-head"><div><p class="eyebrow">My focus this week</p><h2 class="big">${(session.focus || []).map(f => esc(f.label)).join(' + ')}</h2></div>
+    <div class="muted small">From your 1:1 on ${dateLabel(session.date)} with ${esc(session.coachName || session.coach)}</div></div>
+    <div class="fus">${followUp('one', session, c.k)}</div>
+    <p><b>My plan:</b> ${esc(session.commitment || '')}</p>
+    ${session.support ? `<p class="small"><b>My leader will:</b> ${esc(session.support)}</p>` : ''}
+    ${session.notes ? `<p class="small muted">${esc(session.notes)}</p>` : ''}
+  </section>`;
+}
+function teamFocus(total, session) {
+  if (!session) return '';
+  return `<section class="panel coach team mine">
+    <div class="card-head"><div><p class="eyebrow">Team focus this week</p><h2 class="big">${(session.focus || []).map(f => esc(f.label)).join(' + ')}</h2></div>
+    <div class="muted small">${esc(session.store)} team, ${dateLabel(session.date)} with ${esc(session.coachName || session.coach)}</div></div>
+    ${total ? `<div class="fus">${followUp('team', session, total.k)}</div>` : ''}
+    <p><b>Team plan:</b> ${esc(session.commitment || '')}</p>
+    ${session.support ? `<p class="small"><b>Leaders will:</b> ${esc(session.support)}</p>` : ''}
+    ${session.notes ? `<p class="small muted">${esc(session.notes)}</p>` : ''}
+  </section>`;
+}
+
+// ---------------------------------------------------------------- upload (weekly: RSA report + daily report)
+function viewUpload() {
+  const m = S.meta;
+  const last = (x, what) => x ? `<li>${what}: <b>${esc(x.file)}</b>, ${new Date(x.at).toLocaleString('en-US')} by ${esc(x.by)}</li>` : '';
+  $('#view').innerHTML = `
+  <div class="panel">
+    <h2>Upload this week's files</h2>
+    <p>Drop both files together (or one at a time):</p>
+    <ol class="small">
+      <li><b>RSA report</b> for the 1st of the month through the latest day, for example <code>rsa_report_2026-09-01_to_2026-09-28.csv</code>. Keep the dates in the file name; the app reads them.</li>
+      <li><b>Daily report</b> for the latest day, for example <code>daily-report-2026-09-28.csv</code>. The app uses its month-to-date numbers for the store totals.</li>
+    </ol>
+    ${m.lastRsa || m.lastDaily ? `<ul class="muted small">${last(m.lastRsa, 'Last RSA report')}${last(m.lastDaily, 'Last daily report')}</ul>` : ''}
+    <label class="drop" id="drop"><input type="file" id="file" accept=".csv,.xlsx,.xls" multiple><span><b>Choose files</b> or drag them here</span></label>
+    ${DEMO ? `<p class="small">Demo: <button class="link" id="sample">load this week's sample files</button> to see the preview.</p>` : ''}
+    <div id="preview"></div>
+  </div>`;
+  const handle = async files => {
+    S.pending = S.pending || {};
+    for (const file of files) {
+      try {
+        const rows = await readSpreadsheet(file);
+        addPending(file.name, rows);
+      } catch (e) { toast(`Could not read ${file.name}: ${e.message}`, true); }
+    }
+    await renderPending();
+  };
+  $('#file').onchange = e => handle([...e.target.files]);
+  const drop = $('#drop');
+  drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+  drop.ondragleave = () => drop.classList.remove('over');
+  drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); handle([...e.dataTransfer.files]); };
+  const sb = $('#sample');
+  if (sb) sb.onclick = async () => { S.pending = {}; S.be.sampleFiles().forEach(([n, rows]) => addPending(n, rows)); await renderPending(); };
+  if (S.pending) renderPending();
+}
+
+function addPending(name, rows) {
+  const heads = new Set(Object.keys(rows[0] || {}).map(h => h.trim().toLowerCase()));
+  if (heads.has('sales associate')) {
+    const parsed = parseRsa(rows);
+    const range = rangeFromFileName(name) || {};
+    S.pending.rsa = { file: name, parsed, from: range.from || '', to: range.to || '', assign: {} };
+  } else if (heads.has('segment') && heads.has('metric')) {
+    S.pending.daily = { file: name, parsed: parseDailyReport(rows) };
+  } else {
+    toast(`${name} does not look like the RSA report or the daily report.`, true);
+  }
+}
+
+async function renderPending() {
+  const p = $('#preview'); if (!p) return;
+  const P = S.pending || {};
+  const dir = await S.be.directory();
+  const dmap = Object.fromEntries(dir.map(d => [d.cid, d]));
+  let html = '';
+  if (P.rsa) {
+    const r = P.rsa.parsed;
+    if (r.missing.length) html += `<div class="warnbox"><b>${esc(P.rsa.file)} is missing columns:</b> ${r.missing.map(c => `<code>${c}</code>`).join(' ')}</div>`;
+    else {
+      const res = resolveReportNames(r.people, dir);
+      P.rsa.res = res;
+      res.unmatched.forEach(x => { if (!(x.cid in P.rsa.assign)) { const sg = res.suggestions[x.cid]; P.rsa.assign[x.cid] = sg ? 'link:' + sg.cid : ''; } });
+      const skipped = res.matched.filter(m => m.d.store === SKIP).length;
+      const badStart = P.rsa.from && !P.rsa.from.endsWith('-01');
+      const openOpts = (sel, sg) => {
+        const byStore = {};
+        res.openRoster.forEach(d => (byStore[d.store] ||= []).push(d));
+        return (sg && sg.how === 'possible' ? `<option value="link:${esc(sg.cid)}" ${sel === 'link:' + sg.cid ? 'selected' : ''}>Possible match: ${esc(dir.find(d => d.cid === sg.cid).name)} (${esc(dir.find(d => d.cid === sg.cid).store)})</option>` : '')
+          + ALL_STORE_NAMES.filter(n => byStore[n]).map(n => `<optgroup label="Same person as, at ${esc(n)}">${byStore[n].map(d => `<option value="link:${esc(d.cid)}" ${sel === 'link:' + d.cid ? 'selected' : ''}>${esc(d.name)}${d.title && d.title !== 'RSA' ? ' (' + d.title + ')' : ''}</option>`).join('')}</optgroup>`).join('');
+      };
+      html += `<section class="pend"><h3>RSA report <span class="muted small">${esc(P.rsa.file)}</span></h3>
+        <div class="formgrid"><label>From<input type="date" id="r_from" value="${P.rsa.from}"></label><label>Through<input type="date" id="r_to" value="${P.rsa.to}"></label></div>
+        ${!P.rsa.from || !P.rsa.to ? `<div class="warnbox">The dates were not in the file name. Enter them above.</div>` : ''}
+        ${badStart ? `<div class="warnbox"><b>Heads up:</b> this report starts on ${dateLabel(P.rsa.from)}, not the 1st. The scorecard expects month to date.</div>` : ''}
+        <p class="small"><b>${r.people.length}</b> selling consultants. <b>${res.matched.length - skipped}</b> matched to the team roster${skipped ? `, ${skipped} marked not a consultant` : ''}. ${res.unmatched.length ? `<b class="err">${res.unmatched.length} not matched</b> (below).` : 'Everyone is matched.'}</p>
+        <p class="muted small">Left out: ${r.skipped.map(esc).join(', ') || 'none'}, plus ${r.nonSellers.length} people with no sales hours this month (leaders, returns only).</p>
+        ${!dir.length ? `<div class="warnbox">No team roster loaded yet. Load it on the Consultants tab first, then come back. Every name will match.</div>` : ''}
+        ${res.unmatched.length ? `<div class="assign">
+          <p class="small"><b>Names in the report that are not on the roster.</b> Usually a nickname, a name change, or someone new. Pick who they are on the roster, or give them a store. Suggestions are filled in; check them. Anyone on "Leave out for now" will not show this week.</p>
+          ${res.unmatched.some(x => !res.suggestions[x.cid]) ? `<p class="small"><button class="btn tiny" id="skipall">Leave off everyone with no match</button> <span class="muted">Sets every row without a suggestion to "Leave off, don't ask again". You can bring anyone back on the Consultants tab.</span></p>` : ''}
+          <div class="scroller"><table class="mini"><thead><tr><th>Name in report</th><th class="num">Net Sales</th><th class="num">SPH</th><th>Who is this?</th></tr></thead><tbody>
+          ${res.unmatched.sort((a, b) => b.k.netSales - a.k.netSales).map(x => { const sel = P.rsa.assign[x.cid]; const sg = res.suggestions[x.cid]; return `<tr><td>${esc(x.name)}${sg ? `<small class="sugg ${sg.how === 'possible' ? 'weak' : ''}">${sg.how === 'possible' ? 'Possible match (same last name): check it' : `Suggested by ${sg.how === 'email' ? 'work email' : 'name'}`}</small>` : ''}</td><td class="num">${fmt(METRICS[0], x.k.netSales)}</td><td class="num">${fmt(METRICS[1], x.k.sph)}</td>
+            <td><select data-assign="${esc(x.cid)}"><option value="">Leave out for now</option><option value="${SKIP}" ${sel === SKIP ? 'selected' : ''}>Leave off, don't ask again</option>${openOpts(sel, sg)}
+            ${ALL_STORE_NAMES.map(n => `<option value="store:${esc(n)}" ${sel === 'store:' + n ? 'selected' : ''}>New person at ${esc(n)}</option>`).join('')}</select></td></tr>`; }).join('')}
+          </tbody></table></div></div>` : ''}
+      </section>`;
+    }
+  }
+  if (P.daily) {
+    const d = P.daily.parsed;
+    if (d.missing.length) html += `<div class="warnbox"><b>${esc(P.daily.file)} is missing columns:</b> ${d.missing.map(c => `<code>${c}</code>`).join(' ')}</div>`;
+    else {
+      const missingStores = ALL_STORE_NAMES.filter(n => !d.stores.some(s => s.store === n));
+      html += `<section class="pend"><h3>Daily report <span class="muted small">${esc(P.daily.file)}</span></h3>
+        <p class="small">Month to date through <b>${dateLabel(d.date)}</b>. <b>${d.stores.length} of 41</b> stores found.${missingStores.length ? ` Missing: ${missingStores.map(esc).join(', ')}.` : ''}</p>
+        ${d.unknown.length ? `<div class="warnbox"><b>Not matched to a store:</b> ${d.unknown.map(esc).join(', ')}. Tell Claude so it can be added.</div>` : ''}
+        <p class="muted small">Region, Online and Total rows are skipped.</p>
+      </section>`;
+    }
+  }
+  const ready = (P.rsa && !P.rsa.parsed.missing.length && P.rsa.from && P.rsa.to) || (P.daily && !P.daily.parsed.missing.length);
+  html += (P.rsa || P.daily) ? `<div class="row"><button class="btn primary" id="pub" ${ready ? '' : 'disabled'}>Publish</button><button class="btn" id="clr">Clear</button><span id="prog" class="muted small"></span></div>` : '';
+  p.innerHTML = html;
+  p.querySelectorAll('[data-assign]').forEach(s => s.onchange = () => { P.rsa.assign[s.dataset.assign] = s.value; });
+  const sk = $('#skipall'); if (sk) sk.onclick = () => { P.rsa.res.unmatched.forEach(x => { if (!P.rsa.res.suggestions[x.cid]) P.rsa.assign[x.cid] = SKIP; }); renderPending(); };
+  const rf = $('#r_from'), rt = $('#r_to');
+  if (rf) rf.onchange = () => { P.rsa.from = rf.value; renderPending(); };
+  if (rt) rt.onchange = () => { P.rsa.to = rt.value; renderPending(); };
+  const clr = $('#clr'); if (clr) clr.onclick = () => { S.pending = null; viewUpload(); };
+  const pub = $('#pub'); if (pub) pub.onclick = () => publishPending(dmap);
+}
+
+async function publishPending(dmap) {
+  const P = S.pending, b = $('#pub'); b.disabled = true;
+  try {
+    let msg = [];
+    if (P.rsa && !P.rsa.parsed.missing.length) {
+      const res = P.rsa.res;
+      const byCid = { ...dmap };
+      const resolved = new Map(res.matched.map(m => [m.p.cid, m.d]));
+      const saves = [];
+      for (const x of res.unmatched) {
+        const v = P.rsa.assign[x.cid] || '';
+        if (!v) continue;
+        if (v === SKIP) { const d = { cid: x.cid, name: x.name, store: SKIP }; saves.push(d); resolved.set(x.cid, d); }
+        else if (v.startsWith('store:')) { const d = { cid: x.cid, name: x.name, store: v.slice(6), title: 'RSA', aliases: [] }; saves.push(d); resolved.set(x.cid, d); }
+        else if (v.startsWith('link:')) {
+          const d = byCid[v.slice(5)]; if (!d) continue;
+          d.aliases = [...new Set([...(d.aliases || []), x.cid])]; saves.push(d); resolved.set(x.cid, d);
+        }
+      }
+      if (saves.length) await S.be.saveDirectory(saves);
+      const seen = new Set();
+      const people = P.rsa.parsed.people.map(x => {
+        const d = resolved.get(x.cid);
+        if (!d || d.store === SKIP || seen.has(d.cid)) return null;
+        seen.add(d.cid);
+        return { ...x, cid: d.cid, name: d.name, reportName: x.name, store: d.store, title: d.title || 'RSA' };
+      }).filter(Boolean);
+      addRanks(people);
+      await S.be.publishRsa({ month: P.rsa.from.slice(0, 7), from: P.rsa.from, to: P.rsa.to, people, file: P.rsa.file }, (d, t) => $('#prog').textContent = `Saving ${d} of ${t}…`);
+      msg.push(`${people.length} consultant cards`);
+      S.month = P.rsa.from.slice(0, 7);
+    }
+    if (P.daily && !P.daily.parsed.missing.length) {
+      await S.be.publishDaily({ ...P.daily.parsed, file: P.daily.file });
+      msg.push(`${P.daily.parsed.stores.length} store totals`);
+    }
+    toast(`Published ${msg.join(' and ')}.`);
+    S.pending = null; await loadShared(); S.tab = 'cards'; renderShell();
+  } catch (e) { b.disabled = false; toast('Publish failed: ' + e.message, true); }
+}
+
+// ---------------------------------------------------------------- consultants: team roster and store list
+async function viewDirectory() {
+  const v = $('#view');
+  v.innerHTML = `<div class="loading">Loading consultants…</div>`;
+  const dir = (await S.be.directory()).sort((a, b) => (a.store || '').localeCompare(b.store || '') || a.name.localeCompare(b.name));
+  const f = S.dirFilter || '';
+  const shown = dir.filter(d => !f || d.store === f);
+  const counts = {}; dir.forEach(d => counts[d.store] = (counts[d.store] || 0) + 1);
+  const active = dir.filter(d => d.store !== SKIP);
+  const lr = S.meta.lastRoster;
+  v.innerHTML = `
+  <div class="panel">
+    <h2>Team roster</h2>
+    <p>Load the Store Sales Team Contacts file (the Paylocity export with Location, Role, Name and Email). It sets each person's store and title, and can set up their logins. Reload it whenever people join, leave or transfer.</p>
+    ${lr ? `<p class="muted small">Last loaded: ${esc(lr.file)}, ${new Date(lr.at).toLocaleString('en-US')} (${lr.people} people)</p>` : ''}
+    <label class="drop" id="rdrop"><input type="file" id="rfile" accept=".xlsx,.xls,.csv"><span><b>Choose the roster file</b> or drag it here</span></label>
+    ${DEMO ? `<p class="small">Demo: <button class="link" id="rsample">load a sample roster</button></p>` : ''}
+    <div id="rprev"></div>
+  </div>
+  <div class="panel flush">
+    <div class="panel-head"><h2>${active.length} on the team</h2>
+      <label class="inline">Show <select id="dfil"><option value="">All stores</option>${storeOptions(ALL_STORE_NAMES.filter(n => counts[n]), f)}<option value="${SKIP}" ${f === SKIP ? 'selected' : ''}>Left off (${counts[SKIP] || 0})</option></select></label></div>
+    <div class="scroller"><table class="grid"><thead><tr><th>Name</th><th>Title</th><th>Store</th><th>Also appears in the report as</th><th></th></tr></thead>
+    <tbody>${shown.map(d => `<tr><td class="nm">${esc(d.name)}${d.email ? `<small>${esc(d.email)}</small>` : ''}</td><td>${esc(d.title || '')}</td>
+      <td><select data-dstore="${esc(d.cid)}">${storeOptions(ALL_STORE_NAMES, d.store, `<option value="${SKIP}" ${d.store === SKIP ? 'selected' : ''}>Not a consultant</option>`)}</select></td>
+      <td class="small">${(d.aliases || []).map(a => `<span class="alias">${esc(a.replace(/-/g, ' '))} <button class="link small" data-unalias="${esc(d.cid)}|${esc(a)}" aria-label="Unlink">x</button></span>`).join(' ')}</td>
+      <td class="acts"><button class="link danger" data-ddel="${esc(d.cid)}">Remove</button></td></tr>`).join('') || `<tr><td colspan="5" class="muted">Nobody yet. Load the team roster above.</td></tr>`}</tbody></table></div>
+  </div>`;
+  $('#dfil').onchange = e => { S.dirFilter = e.target.value; viewDirectory(); };
+  v.querySelectorAll('[data-dstore]').forEach(s => s.onchange = async () => {
+    const d = dir.find(x => x.cid === s.dataset.dstore);
+    await S.be.saveDirectory([{ ...d, store: s.value }]);
+    toast(`${d.name} moved to ${s.value === SKIP ? 'not a consultant' : s.value}. Takes effect on the next upload.`);
+  });
+  v.querySelectorAll('[data-unalias]').forEach(b => b.onclick = async () => {
+    const [cid, a] = b.dataset.unalias.split('|'); const d = dir.find(x => x.cid === cid);
+    await S.be.saveDirectory([{ ...d, aliases: (d.aliases || []).filter(x => x !== a) }]); toast('Unlinked.'); viewDirectory();
+  });
+  v.querySelectorAll('[data-ddel]').forEach(b => b.onclick = async () => {
+    if (b.dataset.confirm !== '1') { b.dataset.confirm = '1'; b.textContent = 'Tap again'; return; }
+    await S.be.deleteDirectory(b.dataset.ddel); toast('Removed.'); viewDirectory();
+  });
+  const handle = async (name, rows) => rosterPreview(name, parseTeamRoster(rows), dir);
+  $('#rfile').onchange = async e => { const file = e.target.files[0]; if (file) handle(file.name, await readSpreadsheet(file)); };
+  const rd = $('#rdrop');
+  rd.ondragover = e => { e.preventDefault(); rd.classList.add('over'); };
+  rd.ondragleave = () => rd.classList.remove('over');
+  rd.ondrop = async e => { e.preventDefault(); rd.classList.remove('over'); const file = e.dataTransfer.files[0]; if (file) handle(file.name, await readSpreadsheet(file)); };
+  const rs = $('#rsample'); if (rs) rs.onclick = () => handle('Store_Sales_Team_Contacts_sample.xlsx', S.be.sampleRoster());
+}
+
+async function rosterPreview(file, t, dir) {
+  const p = $('#rprev');
+  if (t.missing.length) { p.innerHTML = `<div class="warnbox"><b>This does not look like the team roster.</b> Missing columns: ${t.missing.join(', ')}. Use the "Sales Team" sheet.</div>`; return; }
+  const users = await S.be.users();
+  const uByEmail = Object.fromEntries(users.map(u => [u.email, u]));
+  const inRoster = new Set(t.people.map(x => x.cid));
+  const gone = dir.filter(d => d.store !== SKIP && d.title && !inRoster.has(d.cid));
+  const byTitle = t.people.reduce((a, x) => (a[x.title] = (a[x.title] || 0) + 1, a), {});
+  const noEmail = t.people.filter(x => !x.email);
+  const protectedRoles = ['admin', 'exec', 'director'];
+  const loginPlan = t.people.filter(x => x.email && !protectedRoles.includes(uByEmail[x.email]?.role));
+  const newLogins = loginPlan.filter(x => !uByEmail[x.email]).length;
+  p.innerHTML = `
+    <p class="small"><b>${t.people.length}</b> people: ${Object.entries(byTitle).map(([k, n]) => `${n} ${k === 'ASM' ? 'Assistant Selling Managers' : k === 'Sales Lead' ? 'Sales Leads' : 'RSAs'}`).join(', ')}. ${t.open.length} open leader seats (skipped).</p>
+    <p class="small">Assistant Selling Managers and Sales Leads get a login that shows <b>their own scorecard</b> and lets them <b>coach the rest of their store</b>, one on one and as a team. RSAs get a login that shows only their own card and their store.</p>
+    ${t.badStores.length ? `<div class="warnbox"><b>Locations not on the store list:</b> ${t.badStores.map(esc).join(', ')}. Those rows were skipped.</div>` : ''}
+    ${gone.length ? `<div class="warnbox"><b>${gone.length} people in the app are not on this roster</b> (left, transferred out of sales, or renamed): ${gone.slice(0, 15).map(d => esc(d.name)).join(', ')}${gone.length > 15 ? '…' : ''}. <label class="check"><input type="checkbox" id="rgone"> Remove them and their logins</label></div>` : ''}
+    <label class="check"><input type="checkbox" id="rlog" checked> Set up logins by work email (${newLogins} new, ${loginPlan.length - newLogins} updated${noEmail.length ? `, ${noEmail.length} have no email and are skipped` : ''}). Admin, exec and director logins are never changed.</label>
+    <div class="row"><button class="btn primary" id="rgo">Load roster</button><span class="muted small" id="rprog"></span></div>`;
+  $('#rgo').onclick = async () => {
+    $('#rgo').disabled = true;
+    try {
+      const old = Object.fromEntries(dir.map(d => [d.cid, d]));
+      await S.be.saveDirectory(t.people.map(x => ({ cid: x.cid, name: x.name, store: x.store, title: x.title, email: x.email, aliases: old[x.cid]?.aliases || [] })));
+      if ($('#rlog').checked) {
+        await S.be.saveUsers(loginPlan.map(x => ({
+          email: x.email, name: x.name, title: x.title, cid: x.cid, stores: [x.store],
+          role: x.title === 'RSA' ? 'consultant' : 'leader', canUpload: !!uByEmail[x.email]?.canUpload
+        })));
+      }
+      if ($('#rgone')?.checked) {
+        for (const d of gone) { await S.be.deleteDirectory(d.cid); const u = users.find(u => u.cid === d.cid && !protectedRoles.includes(u.role)); if (u) await S.be.deleteUser(u.email); }
+      }
+      await S.be.saveMeta({ lastRoster: { file, at: new Date().toISOString(), people: t.people.length } });
+      toast(`Roster loaded: ${t.people.length} people.`); await loadShared(); viewDirectory();
+    } catch (e) { $('#rgo').disabled = false; toast('Could not load: ' + e.message, true); }
+  };
+}
+
+// ---------------------------------------------------------------- logins (admin)
+async function viewRoster() {
+  const v = $('#view');
+  v.innerHTML = `<div class="loading">Loading…</div>`;
+  const [users, dir] = await Promise.all([S.be.users(), S.be.directory()]);
+  users.sort((a, b) => (a.role + a.name).localeCompare(b.role + b.name));
+  const people = dir.filter(d => d.store !== SKIP).sort((a, b) => a.name.localeCompare(b.name));
+  const dname = cid => dir.find(d => d.cid === cid)?.name || cid || '';
+  const counts = ROLES.map(([r, l]) => `${l}: ${users.filter(u => u.role === r).length}`).join(' · ');
+  v.innerHTML = `
+  <div class="panel">
+    <h2>Add or edit a login</h2>
+    <form id="uf" class="formgrid">
+      <label>Email<input id="u_em" type="email" required></label>
+      <label>Name<input id="u_nm" required></label>
+      <label>Role<select id="u_rl">${ROLES.map(([r, l]) => `<option value="${r}">${l}</option>`).join('')}</select></label>
+      <label>Stores <small>directors and leaders; comma separated, or * for all</small><input id="u_st" list="storelist" placeholder="Tallahassee, Thomasville"></label>
+      <label>Their own scorecard <small>consultants, ASMs and Sales Leads: pick their name</small><input id="u_cn" list="conslist" placeholder="Start typing a name"></label>
+      <label class="check"><input type="checkbox" id="u_up"> Can upload files</label>
+      <div class="row"><button class="btn primary">Save login</button><button type="button" class="btn" id="u_clear">Clear</button></div>
+    </form>
+    <datalist id="storelist">${ALL_STORE_NAMES.map(s => `<option value="${esc(s)}">`).join('')}</datalist>
+    <datalist id="conslist">${people.map(d => `<option value="${esc(d.name)}">${esc(d.store)}</option>`).join('')}</datalist>
+  </div>
+  <div class="panel">
+    <h2>Bulk load</h2>
+    <p>CSV columns <code>email, name, role, stores, consultant, canUpload</code>. Roles: admin, exec, director, leader, consultant. For consultants, <code>consultant</code> is their name exactly as in the RSA report and <code>stores</code> can be blank. Separate multiple stores with a semicolon.</p>
+    <div class="row">
+      <label class="btn">Upload logins CSV<input type="file" id="rcsv" accept=".csv" hidden></label>
+      <button class="btn" id="rtpl">Download consultants without a login</button>
+      <button class="btn" id="rexp">Export logins</button>
+    </div>
+  </div>
+  <div class="panel flush">
+    <div class="panel-head"><h2>Logins <span class="count">${users.length}</span></h2><span class="muted small">${counts}</span></div>
+    <div class="scroller"><table class="grid roster"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Title</th><th>Stores</th><th>Own card</th><th>Upload</th><th></th></tr></thead>
+    <tbody>${users.map(u => `<tr><td class="nm">${esc(u.name)}</td><td>${esc(u.email)}</td><td>${esc(roleLabel(u.role))}</td><td>${esc(u.title || '')}</td><td>${esc((u.stores || []).join(', '))}</td><td>${esc(u.cid ? dname(u.cid) : '')}</td><td>${u.canUpload ? 'Yes' : ''}</td>
+      <td class="acts"><button class="link" data-edit="${esc(u.email)}">Edit</button>${u.email === OWNER_EMAIL ? '' : `<button class="link danger" data-del="${esc(u.email)}">Remove</button>`}</td></tr>`).join('')}</tbody></table></div>
+  </div>`;
+  const fill = u => { $('#u_em').value = u?.email || ''; $('#u_nm').value = u?.name || ''; $('#u_rl').value = u?.role || 'consultant'; $('#u_st').value = (u?.stores || []).join(', '); $('#u_cn').value = u?.cid ? dname(u.cid) : ''; $('#u_up').checked = !!u?.canUpload; };
+  fill(null);
+  $('#u_clear').onclick = () => fill(null);
+  v.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => { fill(users.find(u => u.email === b.dataset.edit)); window.scrollTo({ top: 0, behavior: 'smooth' }); });
+  v.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    if (b.dataset.confirm !== '1') { b.dataset.confirm = '1'; b.textContent = 'Tap again to remove'; return; }
+    await S.be.deleteUser(b.dataset.del); toast('Removed.'); viewRoster();
+  });
+  $('#uf').onsubmit = async e => {
+    e.preventDefault();
+    const u = cleanUser({ email: $('#u_em').value, name: $('#u_nm').value, role: $('#u_rl').value, stores: $('#u_st').value, consultant: $('#u_cn').value, canUpload: $('#u_up').checked }, dir);
+    if (u.error) return toast(u.error, true);
+    await S.be.saveUser(u); toast(`Saved ${u.name}.`); viewRoster();
+  };
+  $('#rcsv').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    const rows = parseCsvText(await f.text());
+    const good = [], bad = [];
+    rows.forEach((r, i) => {
+      const o = {}; Object.entries(r).forEach(([k, val]) => o[k.trim().toLowerCase()] = val);
+      if (!String(o.email || '').trim()) return;
+      const u = cleanUser({ email: o.email, name: o.name, role: o.role, stores: (o.stores || '').replace(/;/g, ','), consultant: o.consultant, canUpload: /^(y|yes|true|1)$/i.test(o.canupload || '') }, dir);
+      u.error ? bad.push(`Row ${i + 2}: ${u.error}`) : good.push(u);
+    });
+    if (bad.length) toast(`${bad.length} rows skipped. First: ${bad[0]}`, true);
+    if (good.length) { await S.be.saveUsers(good); toast(`Loaded ${good.length} logins.`); viewRoster(); }
+  };
+  $('#rtpl').onclick = () => {
+    const have = new Set(users.map(u => u.cid).filter(Boolean));
+    download('consultant-logins-to-add.csv', ['email,name,role,stores,consultant,canUpload',
+      ...people.filter(d => !have.has(d.cid)).map(d => ['', titleName(d.name), 'consultant', '', d.name, ''].map(csvEscape).join(','))].join('\n'));
+  };
+  $('#rexp').onclick = () => download('logins.csv', ['email,name,role,stores,consultant,canUpload', ...users.map(u => [u.email, u.name, u.role, (u.stores || []).join(';'), u.cid ? dname(u.cid) : '', u.canUpload ? 'yes' : ''].map(csvEscape).join(','))].join('\n'));
+}
+function cleanUser({ email, name, role, stores, consultant, canUpload }, dir) {
+  email = String(email || '').trim().toLowerCase();
+  role = String(role || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+$/.test(email)) return { error: `Bad email "${email}"` };
+  if (!ROLES.some(r => r[0] === role)) return { error: `Unknown role "${role}" for ${email}` };
+  const st = String(stores || '').split(',').map(s => s.trim()).filter(Boolean).map(s => s === '*' ? s : canonicalStore(s));
+  if (['director', 'leader'].includes(role) && !st.length) return { error: `${email} needs at least one store` };
+  const u = { email, name: String(name || email).trim(), role, stores: ['admin', 'exec'].includes(role) ? ['*'] : st, canUpload: !!canUpload };
+  if (role === 'consultant' || (role === 'leader' && consultant)) {
+    const cid = cidOf(String(consultant || '').trim());
+    const d = dir.find(x => x.cid === cid || (x.aliases || []).includes(cid));
+    if (!consultant || !d) return { error: `${email}: "${consultant || ''}" is not on the Consultants list` };
+    u.cid = d.cid; u.title = d.title || (role === 'leader' ? 'Sales Lead' : 'RSA');
+    if (role === 'consultant' || !u.stores.length) u.stores = [d.store];
+  }
+  return u;
+}
+
+// ---------------------------------------------------------------- goals (admin)
+function viewGoals() {
+  const g = S.goals;
+  const outlet = g.outlet || {};
+  const set = new Set(g.outletStores || []);
+  const rows = [...METRICS, ...STORE_METRICS.filter(m => ['appsToTraffic', 'protectionAttach'].includes(m.key))];
+  $('#view').innerHTML = `
+  <form class="panel" id="gf">
+    <h2>Goals</h2>
+    <p class="muted small">Green at or better than goal, amber within 20 percent, red beyond that. Cancellation % and Discount % are better when lower. Net Sales and Credit Apps are monthly, so they are compared to the share of the month that has passed. Store Net Sales, SPG, Close Rate and Traffic use each store's budget from the daily report.</p>
+    <div class="scroller"><table class="grid goals"><thead><tr><th>Metric</th><th>Where</th><th class="num">Standard</th><th class="num">Outlet</th></tr></thead>
+    <tbody>${rows.map(m => `<tr><td class="nm">${esc(m.label)}</td><td class="small">${METRICS.includes(m) ? 'Consultant' + (STORE_METRICS.some(s => s.key === m.key) ? ' and store' : '') + (m.derived ? ` (${esc(m.derived)})` : '') : 'Store only'}</td>
+      <td class="num"><input type="number" step="any" name="s_${m.key}" value="${g.standard[m.key] ?? ''}"></td>
+      <td class="num"><input type="number" step="any" name="o_${m.key}" value="${outlet[m.key] ?? ''}" placeholder="same"></td></tr>`).join('')}</tbody></table></div>
+    <h3>Minimum standard</h3>
+    <p class="muted small">Rolling sales per hour is last month plus this month to date. Consultants below it are flagged on their card, in the store list, and in the 1:1. Within 10 percent above it shows as a warning.</p>
+    <div class="formgrid">
+      <label>Standard stores ($ SPH)<input type="number" name="minSph" value="${g.minSph ?? 250}"></label>
+      <label>Outlets ($ SPH)<input type="number" name="outletMinSph" value="${g.outletMinSph ?? 150}"></label>
+    </div>
+    <h3>Outlet stores</h3>
+    <p class="muted small">Checked stores use the Outlet column and the outlet minimum. Blank outlet cells fall back to standard.</p>
+    <div class="checks">${STORES.map(st => `<label class="check"><input type="checkbox" name="os" value="${esc(st.name)}" ${set.has(st.name) ? 'checked' : ''}> ${esc(st.name)}</label>`).join('')}</div>
+    <div class="row"><button class="btn primary">Save goals</button></div>
+  </form>`;
+  $('#gf').onsubmit = async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const standard = {}, o = {};
+    rows.forEach(m => {
+      const s = fd.get('s_' + m.key), ov = fd.get('o_' + m.key);
+      standard[m.key] = s === '' ? null : Number(s);
+      if (ov !== '' && ov !== null) o[m.key] = Number(ov);
+    });
+    const goals = { standard, outlet: Object.keys(o).length ? o : null, outletStores: fd.getAll('os'),
+      minSph: Number(fd.get('minSph')) || 250, outletMinSph: Number(fd.get('outletMinSph')) || 150 };
+    await S.be.saveGoals(goals); await loadShared(); toast('Goals saved.');
+  };
+}
+
+// ---------------------------------------------------------------- demo role switcher
+if (DEMO) {
+  window.addEventListener('DOMContentLoaded', () => {
+    const sel = $('#demoRole');
+    sel.onchange = async () => { S.be.switchUser(sel.value); S.user = await S.be.profile(); S.tab = 'cards'; S.selected = null; await loadShared(); renderShell(); };
+  });
+}
+window.addEventListener('DOMContentLoaded', boot);
