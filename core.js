@@ -39,6 +39,17 @@ export function daysBetween(a, b) {
   const t = s => { const [y, m, d] = s.split('-').map(Number); return Date.UTC(y, m - 1, d); };
   return Math.round((t(b) - t(a)) / 86400000) + 1;
 }
+// A week is 7 days of the month's goal: monthly totals (Net Sales, Credit Apps) get this share.
+export const WEEK_PACE = 7 / 30.4;
+export function addDaysIso(iso, n) { const [y, m, d] = iso.split('-').map(Number); return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10); }
+export function mondayOf(iso) { const [y, m, d] = iso.split('-').map(Number); const wd = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); return addDaysIso(iso, -((wd + 6) % 7)); }
+// 'month' = 1st of a month through a day in that month; 'week' = 8 days or fewer; otherwise 'other'.
+export function periodOf(from, to) {
+  if (!from || !to || to < from) return 'other';
+  if (from.endsWith('-01') && from.slice(0, 7) === to.slice(0, 7)) return 'month';
+  if (daysBetween(from, to) <= 8) return 'week';
+  return 'other';
+}
 export const monthsBack = (month, n) => {
   const [y, m] = month.split('-').map(Number);
   const out = [];
@@ -224,25 +235,31 @@ export function parseDailyReport(rawRows) {
     if (!seg || /^(total|online)$/i.test(seg) || REGIONS.includes(seg)) { ignored.add(seg); continue; }
     const store = canonicalStore(seg);
     if (!isKnownStore(store)) { unknown.add(seg); continue; }
-    (bySeg[store] ||= {})[String(r.metric).trim()] = { mtd: numOrNull(r.mtd_ty), ly: numOrNull(r.mtd_ly), bud: numOrNull(r.mtd_budget) };
+    (bySeg[store] ||= {})[String(r.metric).trim()] = {
+      mtd: { ty: numOrNull(r.mtd_ty), ly: numOrNull(r.mtd_ly), bud: numOrNull(r.mtd_budget) },
+      wtd: { ty: numOrNull(r.wtd_ty), ly: numOrNull(r.wtd_ly), bud: numOrNull(r.wtd_budget) }
+    };
   }
-  const stores = Object.entries(bySeg).map(([store, m]) => {
+  // which = 'mtd' (tracking) or 'wtd' (week to date, for coaching)
+  const build = (m, which) => {
     const k = {}, budget = {}, vsBudget = {}, vsLy = {};
     for (const sm of STORE_METRICS) {
       if (!sm.src) continue;
-      const x = m[sm.src]; if (!x) { k[sm.key] = null; continue; }
-      k[sm.key] = x.mtd;
-      if (sm.budget && x.bud !== null && x.mtd !== null) {
-        if (sm.budget === 'pct') { vsBudget[sm.key] = x.bud; budget[sm.key] = x.bud > -100 ? Math.round(x.mtd / (1 + x.bud / 100) * 100) / 100 : null; }
-        else { vsBudget[sm.key] = x.bud; budget[sm.key] = Math.round((x.mtd - x.bud / 100) * 100) / 100; }
+      const x = m[sm.src]?.[which]; if (!x) { k[sm.key] = null; continue; }
+      k[sm.key] = x.ty;
+      if (sm.budget && x.bud !== null && x.ty !== null) {
+        if (sm.budget === 'pct') { vsBudget[sm.key] = x.bud; budget[sm.key] = x.bud > -100 ? Math.round(x.ty / (1 + x.bud / 100) * 100) / 100 : null; }
+        else { vsBudget[sm.key] = x.bud; budget[sm.key] = Math.round((x.ty - x.bud / 100) * 100) / 100; }
       }
       if (sm.ly && x.ly !== null) vsLy[sm.key] = x.ly;
     }
-    const canc = m['Cancellations']?.mtd, gross = m['Gross Sales']?.mtd;
+    const canc = m['Cancellations']?.[which]?.ty, gross = m['Gross Sales']?.[which]?.ty;
     k.cancelPct = gross ? Math.round(Math.abs(canc || 0) / gross * 10000) / 100 : null;
-    return { store, k, budget, vsBudget, vsLy };
-  });
-  return { missing: [], date, month: date ? date.slice(0, 7) : null, stores, ignored: [...ignored], unknown: [...unknown] };
+    return { k, budget, vsBudget, vsLy };
+  };
+  const hasWtd = present.has('wtd_ty');
+  const stores = Object.entries(bySeg).map(([store, m]) => ({ store, ...build(m, 'mtd'), week: hasWtd ? build(m, 'wtd') : null }));
+  return { missing: [], date, month: date ? date.slice(0, 7) : null, weekStart: date ? mondayOf(date) : null, stores, ignored: [...ignored], unknown: [...unknown] };
 }
 
 // ---------------------------------------------------------------- goals and status
@@ -297,96 +314,103 @@ export function minStatus(sph, min) {
 // ---------------------------------------------------------------- weekly 1:1 coaching
 // Talk tracks tied to the Core 4: Connection, Finance, Bedding, Presenting Every Option as
 // Protected and Delivered. Net Sales is the result, so it is never picked as a focus.
+// Talk tracks built from 1915 South's own selling processes: Our Core 4, Greet Like A Referral,
+// Presenting Options as Protected and Delivered (Options Calculator), Sleep Made Easy, and the
+// Protection Process. "source" names the process so leaders know what to pull up.
+const GREET = 'Greet Like A Referral';
+const OPTIONS = 'Presenting Options as Protected and Delivered';
+const SLEEP = 'Sleep Made Easy';
+const PROTECT = 'Protection Process';
 export const COACHING = {
   sph: {
-    pillar: 'Connection',
-    why: 'Sales per hour shows how much of their time on the floor turns into sales.',
-    ask: ['Walk me through your last three guests. Where did each one end up?', 'What do you do between guests to create your next sale?'],
-    doThis: 'Take every up in turn, no skipping. Follow up with 3 be-backs every shift.'
-  },
-  avgTicket: {
-    pillar: 'Presenting Every Option',
-    why: 'A low ticket usually means we sold the piece, not the room.',
-    ask: ['On your last sale, what else did you show before you wrote it?', 'What stops you from showing the full room?'],
-    doThis: 'Before writing any sale, show the complete room: tables, rug, accents. Let the guest take things out.'
-  },
-  effMargin: {
-    pillar: 'Presenting Every Option',
-    why: 'Margin drops when we lead with discounts instead of value and payment options.',
-    ask: ['When a guest pushes on price, what do you say first?', 'Where did your last discount come from, and did the guest ask for it?'],
-    doThis: 'Hold price first. Offer the monthly payment before any discount. Bring a leader in before going below price.'
-  },
-  financePct: {
-    pillar: 'Finance',
-    why: 'Finance lets guests buy the room they want. If it comes up late, it rarely comes up at all.',
-    ask: ['At what point in the visit do you bring up financing?', 'How do you present the monthly payment?'],
-    doThis: 'Bring up financing in the first 10 minutes with every guest. Quote the monthly payment next to the price.'
-  },
-  beddingPct: {
-    pillar: 'Bedding',
-    why: 'Every guest sleeps on something. Bedding is the easiest add-on we have and it is often skipped.',
-    ask: ['How many guests did you ask about their sleep this week?', 'What keeps you from walking guests to bedding?'],
-    doThis: 'Ask every guest how they are sleeping. Walk at least 2 guests a day to the bedding gallery.'
-  },
-  protectionPct: {
-    pillar: 'Protected and Delivered',
-    why: 'Protection should be part of how we present the price, not a question at the end.',
-    ask: ['How do you present protection today, and when?', 'What do guests say when they turn it down?'],
-    doThis: 'Quote every item with protection included. Present it as part of the price on every sale.'
-  },
-  deliveryPct: {
-    pillar: 'Protected and Delivered',
-    why: 'Delivery should be the default. Guests who haul it themselves have more damage and more returns.',
-    ask: ['Do you quote the delivered price or the carry-out price first?', 'Why did your last carry-out guest pass on delivery?'],
-    doThis: 'Quote the delivered price first on every sale. Treat carry-out as the exception.'
-  },
-  beddingSph: {
-    pillar: 'Bedding',
-    why: 'Bedding per hour shows whether bedding comes up with every guest, not just the ones who walk in asking for a mattress.',
-    ask: ['How many of your guests this week got asked how they are sleeping?', 'When a guest is shopping a bedroom, when do you bring up the mattress?'],
-    doThis: 'Ask the sleep question with every guest. Walk every bedroom guest to bedding before writing the sale.'
-  },
-  protectionSph: {
-    pillar: 'Protected and Delivered',
-    why: 'Protection per hour shows how often protection is being presented across all the time on the floor.',
-    ask: ['Walk me through how you presented protection on your last sale.', 'Who did you not present protection to this week, and why?'],
-    doThis: 'Present protection on every item on every sale. Quote it inside the price, not as an add-on at the end.'
-  },
-  protectionAttach: {
-    pillar: 'Protected and Delivered',
-    why: 'Attachment shows how many guests leave protected. Six in ten is the standard.',
-    ask: ['Out of your last 10 sales, how many left protected?', 'What do you say when a guest says they do not need it?'],
-    doThis: 'Present protection as part of every quote. Track your sales this week and aim for 6 out of 10 protected.'
-  },
-  cancelPct: {
-    pillar: 'Connection',
-    why: 'A cancellation is a sale we already had. Most come from unclear expectations on delivery, finance approval or the product itself.',
-    ask: ['Walk me through your last cancellation. When did you first know it was at risk?', 'What do you confirm with the guest before they leave?'],
-    doThis: 'Before every guest leaves, confirm the delivery date, the payment and what they bought. Call every guest the next day.'
-  },
-  discountPct: {
-    pillar: 'Presenting Every Option',
-    why: 'Discounts should be the last tool, not the first. Every point of discount comes straight out of margin.',
-    ask: ['On your last discounted sale, who brought up price first?', 'What did you offer before you went to a discount?'],
-    doThis: 'Lead with value and the monthly payment. No discount without a leader, and only after finance has been offered.'
+    pillar: 'Connection', source: GREET,
+    why: 'Connection is how we earn the right to help. Hours turn into sales when every guest gets a real greeting and the Big 3.',
+    ask: ['Walk me through your last greet. Did you make a non-business connection before anything else?', 'On your last three guests, did you give a name and get a name, ask "What project are we working on today?", and explain our tags?'],
+    doThis: 'Greet every guest like a referral: non-business connection first, then the Big 3 (give a name, get a name; "What project are we working on today?"; price tag intro). A flyer in every hand.'
   },
   closeRate: {
-    pillar: 'Connection',
-    why: 'Close rate is how many of our guests leave as customers. Every point is real money with no extra traffic.',
-    ask: ['Which guests walked this week, and why?', 'Who is getting a leader turnover before a guest leaves?'],
-    doThis: 'Every guest gets a turnover to a leader or a second consultant before they leave without buying.'
+    pillar: 'Connection', source: GREET + ' and ' + OPTIONS,
+    why: 'Guests buy from people they like, and when the value is bigger than the cost. Close rate shows if we are earning the right to ask.',
+    ask: ['Which guests walked this week, and did each one get the Big 3?', 'Did every guest who loved something see their options and get asked "Which one of these works best for you?"'],
+    doThis: 'Big 3 with every guest, then set the stage and present the 4 payment options. Ask for the sale every time: "Which one of these works best for you?"'
   },
-  appsToTraffic: {
-    pillar: 'Finance',
-    why: 'Apps to traffic shows how many guests we offer finance to. Ten percent is the standard.',
-    ask: ['At what point in the visit is the team offering the app?', 'Who on the team is running the most apps, and what are they doing differently?'],
-    doThis: 'Offer financing to every guest in the first 10 minutes. Leaders check apps at every huddle.'
+  avgTicket: {
+    pillar: 'Presenting Every Option', source: GREET + ' and ' + PROTECT,
+    why: 'We sell the set of their dreams, not a single piece. Ticket grows when we show the whole collection and build at the first buying signal.',
+    ask: ['On your last sale, which pieces in the collection did you point out during the tag demo?', 'At the first buying signal, did you build the ticket ("Did you want to add the ottoman as well?")?'],
+    doThis: 'In the tag demo, point out pieces in the collection and pivot to the set of their dreams. At the first buying signal, build the ticket before you close.'
+  },
+  effMargin: {
+    pillar: 'Presenting Every Option', source: GREET + ' and ' + OPTIONS,
+    why: 'Margin holds when value leads: everyday low price, the Ashley Advantage, and payment options before any discount.',
+    ask: ['When price comes up, what do you show first: a discount or the Options Calculator?', 'Are you highlighting our everyday low price and the Ashley Advantage in the tag intro?'],
+    doThis: 'Lead with the everyday low price and the Ashley Advantage. Present the 4 payment options before any discount. Discounts only with a leader.'
+  },
+  discountPct: {
+    pillar: 'Presenting Every Option', source: OPTIONS,
+    why: 'Every point of discount comes out of margin. When the guest sees an affordable monthly option, price stops being the question.',
+    ask: ['On your last discounted sale, who brought up price first?', 'Did the guest see all 4 payment options before you went to a discount?'],
+    doThis: 'Set the stage, then present the 4 most popular options from the Options Calculator before any discount is discussed. No discount without a leader.'
+  },
+  financePct: {
+    pillar: 'Finance', source: 'Our Core 4 and ' + OPTIONS,
+    why: 'Finance is not a last resort. It is the first conversation. Buying power changes everything.',
+    ask: ['On your last three guests, when did you run the app: early, late, or not at all?', 'Are you pulling up the Options Calculator from the Brick Wall on every guest?'],
+    doThis: 'Run the app early, every guest. Present the 4 options (12 and 24 months at 0%, 60 months at 0%, 60 months at 9.9%) and ask "Which one of these works best for you?"'
   },
   creditApps: {
-    pillar: 'Finance',
-    why: 'Credit apps open the door to finance. No app, no approval.',
-    ask: ['Who did you offer an app to this week, and who did you skip?', 'How do you ask for the app?'],
-    doThis: 'Offer an app to every guest who likes the room but pauses on price. Aim for 4 or more apps this week.'
+    pillar: 'Finance', source: 'Our Core 4',
+    why: 'Every guest deserves to know their buying power before they decide. No app, no buying power.',
+    ask: ['Who did you run the app for this week, and who did you skip?', 'How are you bringing up the app early in the visit?'],
+    doThis: 'Run it every time. Offer the app early in the visit so the guest shops knowing their buying power.'
+  },
+  appsToTraffic: {
+    pillar: 'Finance', source: 'Our Core 4',
+    why: 'Apps to traffic shows whether finance is the first conversation for the whole team. Ten percent is the standard.',
+    ask: ['At what point in the visit is the team running the app?', 'Who on the team runs the most apps, and what are they doing differently?'],
+    doThis: 'Every guest learns their buying power early. Leaders check apps at every huddle and coach anyone who is not running it every time.'
+  },
+  beddingPct: {
+    pillar: 'Bedding', source: SLEEP,
+    why: 'A home is not complete without a great night of sleep. Treat every guest like a mattress guest; every guest gets the healthy sleep conversation.',
+    ask: ['How many guests did you take through a pillow fitting this week?', 'Which step of Sleep Made Easy do you skip when the floor is busy?'],
+    doThis: 'Run Sleep Made Easy with every guest: our 3 commitments, pillow fitting, comfort test (memory foam, hybrid, coil), top-down in their technology, then recap and close.'
+  },
+  beddingSph: {
+    pillar: 'Bedding', source: SLEEP,
+    why: 'Bedding per hour shows whether the sleep conversation happens with every guest, not just the ones who walk in asking for a mattress.',
+    ask: ['Who did you start the sleep conversation with this week who came in for something else?', 'Are you getting to an 8, 9 or 10 on the comfort scale before you move on?'],
+    doThis: 'Start the healthy sleep conversation with every guest. Use the 1 to 10 scale and do not move on until you get an 8, 9 or 10. Then "Let\'s see if we can get you to a 10" with the adjustable base.'
+  },
+  protectionPct: {
+    pillar: 'Protected and Delivered', source: PROTECT,
+    why: 'We do not finish the sale until the guest is protected. Protection is presented as the complete transaction, not an add-on.',
+    ask: ['At what point did you present protection on your last sale?', 'Did you use all 4 steps: feature and benefit, the Ashley story, 1 year / 4 year, then transition and close?'],
+    doThis: 'At the first buying signal, run the 4 steps: feature and benefit, the Ashley story, the free 1 year warranty plus the 4 year in home service plan, then transition and close.'
+  },
+  protectionSph: {
+    pillar: 'Protected and Delivered', source: PROTECT + ' and ' + OPTIONS,
+    why: 'Protection per hour shows whether protection is presented to every guest across all your time on the floor.',
+    ask: ['Who did not hear about the 4 year in home service plan this week, and why?', 'When you set the stage for options, is the service plan already included?'],
+    doThis: 'Present protection every time: run the 4 steps at the first buying signal, and include the 4 year in home service plan when you set the stage for options.'
+  },
+  protectionAttach: {
+    pillar: 'Protected and Delivered', source: PROTECT,
+    why: 'Attachment shows how many guests leave protected. Six in ten is the standard.',
+    ask: ['Out of your last 10 sales, how many left protected?', 'What do you say when a guest says they do not need it?'],
+    doThis: 'Run the 4-step Protection Process at the first buying signal on every sale, and build the service plan into the options you present.'
+  },
+  deliveryPct: {
+    pillar: 'Protected and Delivered', source: OPTIONS,
+    why: 'We offer a white-glove experience that matches the quality of what our guests are buying. Delivery is part of the complete transaction.',
+    ask: ['When you set the stage for options, do you include white glove delivery every time?', 'Why did your last carry-out guest pass on delivery?'],
+    doThis: 'Set the stage with delivery included: "our white glove delivery service, so we will bring everything in, set it up and remove all of the packing materials."'
+  },
+  cancelPct: {
+    pillar: 'Connection', source: SLEEP + ' (Recap and close the gap)',
+    why: 'A cancellation is a sale we already had. Recapping before the guest leaves locks in comfort, confidence and value.',
+    ask: ['Walk me through your last cancellation. When did you first know it was at risk?', 'Before the guest leaves, do you recap what they bought, their delivery day, and their payment option?'],
+    doThis: 'Recap and close the gap on every sale: comfort, confidence, value. Confirm the delivery day ("weekdays or weekends?") and the payment option they chose.'
   }
 };
 

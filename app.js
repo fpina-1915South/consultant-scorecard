@@ -3,7 +3,7 @@ import {
   METRICS, STORE_METRICS, COACHING, pickFocus, weeklyTarget, DEFAULT_GOALS, STORES, DISTRICTS, OUTLETS, canonicalStore,
   minSphFor, rollingSph, minStatus, monthsBack, isOutlet, goalsFor, paceFactor, status, fmt, fmtGoal, slug, cidOf,
   parseRsa, parseDailyReport, rangeFromFileName, addRanks, daysBetween, TEAM_FOCUS, pickStoreFocus,
-  parseTeamRoster, resolveReportNames
+  parseTeamRoster, resolveReportNames, periodOf, WEEK_PACE, mondayOf, addDaysIso
 } from './core.js';
 
 const DEMO = !firebaseConfig.apiKey || firebaseConfig.apiKey.startsWith('PASTE');
@@ -120,11 +120,36 @@ async function firebaseBackend() {
     },
     async publishDaily(d) {
       const now = new Date().toISOString();
-      await batchWrite(d.stores.map(s => ['set', 'storeTotals', `${d.month}_${slug(s.store)}`, { month: d.month, store: s.store, k: s.k, budget: s.budget, vsBudget: s.vsBudget, vsLy: s.vsLy, asOf: d.date, uploadedAt: now }]));
+      const ops = d.stores.map(s => ['set', 'storeTotals', `${d.month}_${slug(s.store)}`, { month: d.month, store: s.store, k: s.k, budget: s.budget, vsBudget: s.vsBudget, vsLy: s.vsLy, asOf: d.date, uploadedAt: now }]);
+      d.stores.filter(s => s.week).forEach(s => ops.push(['set', 'storeWeekly', `${d.weekStart}_${slug(s.store)}`, { week: d.weekStart, store: s.store, ...s.week, period: 'week', from: d.weekStart, asOf: d.date, uploadedAt: now }]));
+      await batchWrite(ops);
       const meta = await be.meta();
       await F.setDoc(F.doc(db, 'config', 'meta'), { ...meta, months: [...new Set([...(meta.months || []), d.month])].sort().reverse(),
-        storeAsOf: { ...(meta.storeAsOf || {}), [d.month]: d.date }, lastDaily: { by: email(), at: now, file: d.file, stores: d.stores.length } });
+        storeAsOf: { ...(meta.storeAsOf || {}), [d.month]: d.date },
+        storeWeeks: d.weekStart ? [...new Set([...(meta.storeWeeks || []), d.weekStart])].sort().reverse() : (meta.storeWeeks || []),
+        storeWeekAsOf: d.weekStart ? { ...(meta.storeWeekAsOf || {}), [d.weekStart]: d.date } : (meta.storeWeekAsOf || {}),
+        lastDaily: { by: email(), at: now, file: d.file, stores: d.stores.length } });
     },
+    // RSA report for one week (coaching numbers). Replaces that week.
+    async publishWeekly(p, onProgress) {
+      const now = new Date().toISOString();
+      const ops = [], keep = new Set();
+      for (const x of p.people) {
+        const id = `${p.from}_${x.cid}`; keep.add(id);
+        ops.push(['set', 'weekly', id, { week: p.from, cid: x.cid, name: x.name, reportName: x.reportName || x.name, title: x.title || 'RSA', store: x.store, k: x.k, hours: x.hours, rank: x.rank || null, period: 'week', from: p.from, asOf: p.to, uploadedAt: now }]);
+      }
+      (await list('weekly', ['week', p.from])).forEach(d => { if (!keep.has(d.id)) ops.push(['del', 'weekly', d.id]); });
+      await batchWrite(ops, onProgress);
+      const meta = await be.meta();
+      await F.setDoc(F.doc(db, 'config', 'meta'), { ...meta, weeks: [...new Set([...(meta.weeks || []), p.from])].sort().reverse(),
+        weekTo: { ...(meta.weekTo || {}), [p.from]: p.to }, lastWeekly: { by: email(), at: now, file: p.file, people: p.people.length } });
+    },
+    weeklyForStore: (week, store) => list('weekly', ['week', week], ['store', store]),
+    weeklyForCid: cid => list('weekly', ['cid', cid]),
+    async storeWeek(week, store) { const s = await F.getDoc(F.doc(db, 'storeWeekly', `${week}_${slug(store)}`)); return s.exists() ? s.data() : null; },
+    // Director roll-up
+    cardsForMonth: month => list('scorecards', ['month', month]),
+    async coachingSince(iso) { return (await F.getDocs(F.query(F.collection(db, 'coaching'), F.where('createdAt', '>=', iso)))).docs.map(d => ({ id: d.id, ...d.data() })); },
 
     async saveMeta(patch) { const meta = await be.meta(); await F.setDoc(F.doc(db, 'config', 'meta'), { ...meta, ...patch }); },
     // Consultant directory: RSA name -> store.
@@ -171,7 +196,12 @@ function demoBackend() {
       'Prot. % of Sales': pc(4, 11), 'Del. % of Sales': pc(5, 10) };
   };
   const storeRows = date => demoStores.flatMap(st => {
-    const m = (metric, mtd, bud = '') => ({ report_date: date, segment: st.startsWith('Outlet') ? st.replace('Outlet ', '') + ' Outlet' : st, metric, mtd_ty: String(mtd), mtd_ly: '', mtd_budget: String(bud) });
+    const SUMS = ['Net Sales (Stores)', 'Traffic', 'Cancellations', 'Gross Sales'];
+    const m = (metric, mtd, bud = '') => {
+      const wtd = SUMS.includes(metric) ? Number(mtd) * (0.22 + rnd() * 0.06) : Number(mtd) * (0.88 + rnd() * 0.24);
+      return { report_date: date, segment: st.startsWith('Outlet') ? st.replace('Outlet ', '') + ' Outlet' : st, metric, mtd_ty: String(mtd), mtd_ly: '', mtd_budget: String(bud),
+        wtd_ty: wtd.toFixed(2), wtd_ly: '', wtd_budget: bud === '' ? '' : String((Number(bud) + (rnd() * 10 - 5)).toFixed(1)) };
+    };
     const ns = 250000 + rnd() * 300000;
     return [m('Net Sales (Stores)', ns.toFixed(2), (-20 + rnd() * 30).toFixed(1)), m('Sales per Guest w. Cancellations', (420 + rnd() * 200).toFixed(2), (-15 + rnd() * 25).toFixed(1)),
       m('Close Rate', (22 + rnd() * 10).toFixed(1), Math.round(-500 + rnd() * 700)), m('Traffic', Math.round(900 + rnd() * 700), (-10 + rnd() * 15).toFixed(1)),
@@ -182,11 +212,13 @@ function demoBackend() {
       m('Cancellations', (-ns * (0.04 + rnd() * 0.06)).toFixed(2)), m('Gross Sales', (ns * 1.08).toFixed(2))];
   });
   const augRows = people.filter(p => p.store).map(p => rsaRow(p, 31));
+  // last full week (Mon to Sun). One person only worked a day, to show the 20-hour fallback.
+  const weekRows = people.filter(p => p.store).map((p, i) => rsaRow(p, i === 3 ? 1 : 6));
   people[8].reportName = people[8].name.replace(/^(\w{3})\w+/, '$1');   // a nickname in the report, e.g. "Jas" for Jasmine
   const sepRows = people.map(p => ({ ...rsaRow(p, 28), 'Sales Associate': p.reportName || p.name }));
   sepRows.push({ 'Sales Associate': 'HOUSE SALES', 'Net Sales': '900', 'Cancellation %': '0%', 'Discount %': '0%', 'Credit Apps #': '0', 'Eff. Margin': '50%', 'SPH': '0', 'Avg Ticket w. Del.': '0', 'Fin. % of Sales': '0%', 'Bed. % of Sales': '0%', 'Prot. % of Sales': '0%', 'Del. % of Sales': '0%' });
 
-  const cards = {}, totals = {}, dir = {};
+  const cards = {}, totals = {}, dir = {}, weekly = {}, storeWeekly = {};
   let meta = { months: [], asOf: {} };
   let goals = structuredClone(DEFAULT_GOALS);
   const TITLE = i => (i % 6 === 0 ? 'ASM' : i % 6 === 1 ? 'Sales Lead' : 'RSA');
@@ -205,7 +237,7 @@ function demoBackend() {
   const clone = x => structuredClone(x);
   const be = {
     demo: true,
-    sampleFiles: () => [['rsa_report_2026-09-01_to_2026-09-28.csv', sepRows], ['daily-report-2026-09-28.csv', storeRows('2026-09-28')]],
+    sampleFiles: () => [['rsa_report_2026-09-01_to_2026-09-28.csv', sepRows], ['rsa_report_2026-09-21_to_2026-09-27.csv', weekRows], ['daily-report-2026-09-28.csv', storeRows('2026-09-28')]],
     onAuth: cb => cb({ email: current, verified: true }),
     switchUser: e => { current = e; },
     demoUsers: () => Object.values(users),
@@ -224,8 +256,22 @@ function demoBackend() {
       if (!meta.months.includes(p.month)) meta.months.push(p.month); meta.months.sort().reverse();
       meta.asOf[p.month] = p.to; meta.lastRsa = { by: current, at: new Date().toISOString(), file: p.file, people: p.people.length };
     },
+    async publishWeekly(p) {
+      const keep = new Set();
+      p.people.forEach(x => { const id = `${p.from}_${x.cid}`; keep.add(id); weekly[id] = { id, week: p.from, cid: x.cid, name: x.name, reportName: x.reportName || x.name, title: x.title || 'RSA', store: x.store, k: x.k, hours: x.hours, rank: x.rank || null, period: 'week', from: p.from, asOf: p.to }; });
+      Object.keys(weekly).forEach(id => { if (weekly[id].week === p.from && !keep.has(id)) delete weekly[id]; });
+      meta.weeks = [...new Set([...(meta.weeks || []), p.from])].sort().reverse(); meta.weekTo = { ...(meta.weekTo || {}), [p.from]: p.to };
+      meta.lastWeekly = { by: current, at: new Date().toISOString(), file: p.file, people: p.people.length };
+    },
+    weeklyForStore: async (w, st) => Object.values(weekly).filter(c => c.week === w && c.store === st).map(clone),
+    weeklyForCid: async cid => Object.values(weekly).filter(c => c.cid === cid).map(clone),
+    storeWeek: async (w, st) => clone(storeWeekly[`${w}_${slug(st)}`] || null),
+    cardsForMonth: async m => Object.values(cards).filter(c => c.month === m).map(clone),
+    coachingSince: async iso => coaching.filter(x => (x.createdAt || '') >= iso).map(clone),
     async publishDaily(d) {
       d.stores.forEach(s => { totals[`${d.month}_${slug(s.store)}`] = { month: d.month, store: s.store, k: s.k, budget: s.budget, vsBudget: s.vsBudget, vsLy: s.vsLy, asOf: d.date }; });
+      d.stores.filter(s => s.week).forEach(s => { storeWeekly[`${d.weekStart}_${slug(s.store)}`] = { week: d.weekStart, store: s.store, ...s.week, period: 'week', from: d.weekStart, asOf: d.date }; });
+      if (d.weekStart) { meta.storeWeeks = [...new Set([...(meta.storeWeeks || []), d.weekStart])].sort().reverse(); meta.storeWeekAsOf = { ...(meta.storeWeekAsOf || {}), [d.weekStart]: d.date }; }
       if (!meta.months.includes(d.month)) meta.months.push(d.month); meta.months.sort().reverse();
       meta.storeAsOf = { ...(meta.storeAsOf || {}), [d.month]: d.date }; meta.lastDaily = { by: current, at: new Date().toISOString(), file: d.file, stores: d.stores.length };
     },
@@ -247,16 +293,17 @@ function demoBackend() {
     saveUsers: async l => l.forEach(u => users[u.email] = u)
   };
   // Load August and September the same way a real upload would.
-  const load = (rows, from, to) => {
+  const load = (rows, from, to, weekly = false) => {
     const r = parseRsa(rows);
     const res = resolveReportNames(r.people, Object.values(dir));
     const ppl = res.matched.map(({ p, d }) => ({ ...p, cid: d.cid, name: d.name, reportName: p.name, store: d.store, title: d.title })).filter(x => x.store !== SKIP);
     addRanks(ppl);
-    be.publishRsa({ month: from.slice(0, 7), from, to, people: ppl, file: 'demo' });
+    (weekly ? be.publishWeekly : be.publishRsa)({ month: from.slice(0, 7), from, to, people: ppl, file: 'demo' });
   };
   load(augRows, '2026-08-01', '2026-08-31');
   load(sepRows, '2026-09-01', '2026-09-28');
-  const dd = parseDailyReport(storeRows('2026-09-28')); be.publishDaily({ ...dd, file: 'demo' });
+  load(weekRows, '2026-09-21', '2026-09-27', true);
+  const dd = parseDailyReport(storeRows('2026-09-27')); dd.month = '2026-09'; be.publishDaily({ ...dd, file: 'demo' });
   // one past 1:1 so the follow-up view has something to show
   const tp = Object.values(cards).find(c => c.month === '2026-09' && c.cid === users['consultant@demo'].cid);
   const f = pickFocus(tp.k, DEFAULT_GOALS.standard, 0.72).map(x => x.perWeek ? { ...x, value: Math.max(0, x.value - 2) } : { ...x, value: Math.round(x.value * (x.lower ? 1.08 : 0.93) * 10) / 10 });
@@ -267,7 +314,7 @@ function demoBackend() {
 }
 
 // ---------------------------------------------------------------- state
-const S = { sessions: [], coach: null, rolls: {}, be: null, user: null, meta: null, goals: null, month: null, store: null, tab: 'cards', selected: null, pending: null };
+const S = { view: 'mtd', sessions: [], coach: null, rolls: {}, be: null, user: null, meta: null, goals: null, month: null, store: null, tab: 'cards', selected: null, pending: null };
 
 const isAdmin = () => S.user?.role === 'admin';
 const seesAll = () => ['admin', 'exec'].includes(S.user?.role) || (S.user?.stores || []).includes('*');
@@ -313,6 +360,7 @@ async function loadShared() {
   S.goals = { ...DEFAULT_GOALS, ...S.goals, standard: { ...DEFAULT_GOALS.standard, ...(S.goals?.standard || {}) } };
   if (!S.goals.outletStores?.length) S.goals.outletStores = OUTLETS;
   if (!S.month || !S.meta.months.includes(S.month)) S.month = S.meta.months[0] || null;
+  if (!S.viewSet && (S.meta.weeks || []).length) { S.view = S.meta.weeks[0]; S.viewSet = true; }
   const stores = myStores();
   if (!S.store || !stores.includes(S.store)) S.store = stores[0] || null;
 }
@@ -382,6 +430,7 @@ function renderShell() {
   wireSignOut();
   const tabs = [['cards', u.role === 'consultant' ? 'My scorecard' : 'Scorecards']];
   if (u.role !== 'consultant' && u.cid) tabs.push(['mine', 'My scorecard']);
+  if (['admin', 'exec', 'director'].includes(u.role)) tabs.push(['rollup', 'Coaching check']);
   if (canUpload()) tabs.push(['upload', 'Upload'], ['directory', 'Consultants']);
   if (isAdmin()) tabs.push(['roster', 'Logins'], ['goals', 'Goals']);
   if (!tabs.some(t => t[0] === S.tab)) S.tab = 'cards';
@@ -389,7 +438,7 @@ function renderShell() {
     <nav class="tabs">${tabs.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}">${l}</button>`).join('')}</nav>
     <div id="view"></div>`;
   document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; S.selected = null; renderShell(); });
-  ({ cards: viewCards, mine: viewMineTab, upload: viewUpload, directory: viewDirectory, roster: viewRoster, goals: viewGoals })[S.tab]();
+  ({ cards: viewCards, mine: viewMineTab, rollup: viewRollup, upload: viewUpload, directory: viewDirectory, roster: viewRoster, goals: viewGoals })[S.tab]();
 }
 
 // ---------------------------------------------------------------- scorecards
@@ -397,48 +446,89 @@ function pickers(mine = false) {
   const months = S.meta.months || [];
   const showStore = S.user.role !== 'consultant' && !mine;
   const asOf = S.meta.asOf?.[S.month], sAsOf = S.meta.storeAsOf?.[S.month];
+  const weeks = S.meta.weeks || [];
+  const wkLabel = w => `Week of ${dateLabel(w).slice(0, 5)} to ${dateLabel(S.meta.weekTo?.[w] || addDaysIso(w, 6)).slice(0, 5)}`;
   return `<div class="pickers">
-    <label>Month<select id="pm">${months.map(m => `<option value="${m}" ${m === S.month ? 'selected' : ''}>${monthLabel(m)}</option>`).join('')}</select></label>
+    <label>Numbers<select id="pv"><option value="mtd" ${S.view === 'mtd' ? 'selected' : ''}>Month to date (tracking)</option>${weeks.map(w => `<option value="${w}" ${S.view === w ? 'selected' : ''}>${wkLabel(w)} (coaching)</option>`).join('')}</select></label>
+    ${S.view === 'mtd' ? `<label>Month<select id="pm">${months.map(m => `<option value="${m}" ${m === S.month ? 'selected' : ''}>${monthLabel(m)}</option>`).join('')}</select></label>` : ''}
     ${showStore ? `<label>Store<select id="ps">${storeOptions(myStores(), S.store)}</select></label>` : ''}
     <div class="asof">${asOf ? `Consultants through <b>${dateLabel(asOf)}</b>` : ''}${sAsOf ? `<br>Stores through <b>${dateLabel(sAsOf)}</b>` : ''}</div>
   </div>`;
 }
 function wirePickers() {
-  const pm = $('#pm'), ps = $('#ps');
-  if (pm) pm.onchange = () => { S.month = pm.value; S.selected = null; S.tab === 'mine' ? viewMineTab() : viewCards(); };
-  if (ps) ps.onchange = () => { S.store = ps.value; S.selected = null; viewCards(); };
+  const pm = $('#pm'), ps = $('#ps'), pv = $('#pv');
+  const again = () => (S.tab === 'mine' ? viewMineTab() : viewCards());
+  if (pm) pm.onchange = () => { S.month = pm.value; S.selected = null; again(); };
+  if (ps) ps.onchange = () => { S.store = ps.value; S.selected = null; again(); };
+  if (pv) pv.onchange = () => { S.view = pv.value; again(); };
 }
 const daysAgo = iso => Math.floor((Date.now() - new Date(iso + (iso.length === 10 ? 'T12:00:00' : '')).getTime()) / 86400000);
 const todayIso = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 const byNewest = (a, b) => (b.createdAt || '').localeCompare(a.createdAt || '');
 const metricBy = key => METRICS.find(m => m.key === key);
 const prevMonth = m => monthsBack(m, 1)[1];
+const paceOf = c => (c?.period === 'week' ? WEEK_PACE : paceFactor(c?.asOf));
+const periodLabel = c => (c?.period === 'week' ? `Week ${dateLabel(c.from).slice(0, 5)} to ${dateLabel(c.asOf).slice(0, 5)}` : `MTD ${dateLabel(c.from)} to ${dateLabel(c.asOf)}`);
+const MIN_WEEK_HOURS = 20;
+// Coaching runs on the latest week when the person worked enough hours to judge it; otherwise month to date.
+function coachBasis(monthCard, weekCard) {
+  if (weekCard && weekCard.hours >= MIN_WEEK_HOURS) return weekCard;
+  if (!monthCard) return weekCard || null;
+  return { ...monthCard, fallback: weekCard ? `Only ${Math.round(weekCard.hours)} hours last week, too few to judge a week. Coaching on month to date.` : 'No weekly numbers on file yet. Coaching on month to date.' };
+}
+// Team sessions use the store's week that matches the consultants' latest week. A newer partial week
+// only counts once it has at least 3 days in it.
+async function pickStoreWeek(latestWeek, latestStoreWeek, store) {
+  const same = latestWeek ? await S.be.storeWeek(latestWeek, store).catch(() => null) : null;
+  if (same) return same;
+  if (!latestStoreWeek) return null;
+  const w = await S.be.storeWeek(latestStoreWeek, store).catch(() => null);
+  return w && daysBetween(w.from, w.asOf) >= 3 ? w : null;
+}
+function teamBasis(total, storeWk) {
+  if (storeWk?.k) return storeWk;
+  return total ? { ...total, fallback: 'No week-to-date store numbers yet. Coaching on month to date.' } : null;
+}
 
 async function viewCards() {
   const v = $('#view');
   if (!S.month) {
-    v.innerHTML = `<div class="panel"><h2>No data yet</h2><p>${canUpload() ? 'Go to Upload and drop in this week\'s two files.' : 'Scorecards show up here once the first files are uploaded.'}</p></div>`;
+    v.innerHTML = `<div class="panel"><h2>No data yet</h2><p>${canUpload() ? 'Go to Upload and drop in this week\'s files.' : 'Scorecards show up here once the first files are uploaded.'}</p></div>`;
     return;
   }
+  if (S.view !== 'mtd' && !(S.meta.weeks || []).includes(S.view)) S.view = 'mtd';
   v.innerHTML = pickers() + `<div class="loading">Loading…</div>`;
   wirePickers();
   try {
     if (S.user.role === 'consultant') return await viewMine(v);
     if (!S.store) { v.innerHTML = pickers() + `<div class="panel"><p>No stores assigned to you yet. Ask Frank to add your stores.</p></div>`; wirePickers(); return; }
-    const [cards, total, sessions, prev] = await Promise.all([
+    const latestWeek = (S.meta.weeks || [])[0], latestStoreWeek = (S.meta.storeWeeks || [])[0];
+    const viewWeek = S.view === 'mtd' ? null : S.view;
+    const [cards, total, sessions, prev, weekCards, storeWk, viewCardsWk, viewStoreWk] = await Promise.all([
       S.be.cardsForStore(S.month, S.store), S.be.storeTotal(S.month, S.store),
-      S.be.coachingForStore(S.store).catch(() => []), S.be.cardsForStore(prevMonth(S.month), S.store).catch(() => [])
+      S.be.coachingForStore(S.store).catch(() => []), S.be.cardsForStore(prevMonth(S.month), S.store).catch(() => []),
+      latestWeek ? S.be.weeklyForStore(latestWeek, S.store).catch(() => []) : [],
+      pickStoreWeek(latestWeek, latestStoreWeek, S.store),
+      viewWeek && viewWeek !== latestWeek ? S.be.weeklyForStore(viewWeek, S.store).catch(() => []) : null,
+      viewWeek && viewWeek !== latestStoreWeek ? S.be.storeWeek(viewWeek, S.store).catch(() => null) : undefined
     ]);
     sessions.sort(byNewest);
     S.sessions = sessions;
     S.rolls = {};
-    cards.forEach(c => { S.rolls[c.id] = rollFor(c, prev.find(p => p.cid === c.cid)); });
-    cards.sort((a, b) => b.k.netSales - a.k.netSales);
+    cards.forEach(c => { S.rolls[c.cid] = rollFor(c, prev.find(p => p.cid === c.cid)); });
+    // What the table and cards show
+    const shown = viewWeek ? (viewCardsWk || weekCards) : cards;
+    const shownTotal = viewWeek ? (viewStoreWk === undefined ? (latestStoreWeek === viewWeek ? storeWk : null) : viewStoreWk) : total;
+    shown.sort((a, b) => b.k.netSales - a.k.netSales);
     const g = goalsFor(S.goals, S.store);
-    const pace = paceFactor(S.meta.asOf?.[S.month]);
+    const pace = viewWeek ? WEEK_PACE : paceFactor(S.meta.asOf?.[S.month]);
     const minSph = minSphFor(S.goals, S.store);
-    const below = cards.filter(c => S.rolls[c.id].st === 'below'), watch = cards.filter(c => S.rolls[c.id].st === 'watch');
-    const sel = cards.find(c => c.id === S.selected);
+    const people = cards.length ? cards : shown;
+    const below = people.filter(c => S.rolls[c.cid]?.st === 'below'), watch = people.filter(c => S.rolls[c.cid]?.st === 'watch');
+    const selMonth = cards.find(c => c.cid === S.selected), selWeek = weekCards.find(c => c.cid === S.selected);
+    const selShown = shown.find(c => c.cid === S.selected) || selMonth;
+    const basis = S.selected ? coachBasis(selMonth, selWeek) : null;
+    const tBasis = teamBasis(total, storeWk);
     const lastCell = cid => {
       const l = sessions.find(x => !isTeam(x) && x.cid === cid);
       if (!l) return `<td><span class="due">No 1:1 yet</span></td>`;
@@ -448,29 +538,30 @@ async function viewCards() {
     v.innerHTML = pickers()
       + (below.length || watch.length ? `<div class="panel minpanel">
           <h2>Minimum standard: $${minSph} rolling SPH</h2>
-          ${below.length ? `<p class="minrow"><span class="flag below">Below minimum</span> ${below.map(c => `<button class="link" data-jump="${esc(c.id)}">${esc(titleName(c.name))} ($${Math.round(S.rolls[c.id].sph)})</button>`).join(', ')}</p>` : ''}
-          ${watch.length ? `<p class="minrow"><span class="flag watch">Within 10%</span> ${watch.map(c => `<button class="link" data-jump="${esc(c.id)}">${esc(titleName(c.name))} ($${Math.round(S.rolls[c.id].sph)})</button>`).join(', ')}</p>` : ''}
+          ${below.length ? `<p class="minrow"><span class="flag below">Below minimum</span> ${below.map(c => `<button class="link" data-jump="${esc(c.cid)}">${esc(titleName(c.name))} ($${Math.round(S.rolls[c.cid].sph)})</button>`).join(', ')}</p>` : ''}
+          ${watch.length ? `<p class="minrow"><span class="flag watch">Within 10%</span> ${watch.map(c => `<button class="link" data-jump="${esc(c.cid)}">${esc(titleName(c.name))} ($${Math.round(S.rolls[c.cid].sph)})</button>`).join(', ')}</p>` : ''}
         </div>` : '')
-      + (total ? storeCard(total) + `<div id="teamcoach">${coachPanel('team', total)}</div>` : `<div class="panel"><p class="muted">No store report on file for ${esc(S.store)} in ${monthLabel(S.month)} yet.</p></div>`)
-      + (cards.length ? `<div class="panel flush">
-        <div class="panel-head"><h2>Consultants <span class="count">${cards.length}</span></h2><span class="muted small">Tap a name to open their card and weekly 1:1. Sorted by net sales.</span></div>
+      + (shownTotal ? storeCard(shownTotal) : `<div class="panel"><p class="muted">No ${viewWeek ? 'week-to-date' : ''} store report on file for ${esc(S.store)} ${viewWeek ? 'for that week' : 'in ' + monthLabel(S.month)} yet.</p></div>`)
+      + (tBasis ? `<div id="teamcoach">${coachPanel('team', tBasis)}</div>` : '')
+      + (shown.length ? `<div class="panel flush">
+        <div class="panel-head"><h2>Consultants <span class="count">${shown.length}</span> <span class="muted small">${viewWeek ? 'this week' : 'month to date'}</span></h2><span class="muted small">Tap a name to open their card and weekly 1:1. Sorted by net sales.</span></div>
         <div class="scroller"><table class="grid">
-          <thead><tr><th>Consultant</th><th>Last 1:1</th><th class="num">Rolling SPH</th>${METRICS.map(m => `<th class="num">${esc(m.label)}</th>`).join('')}</tr>
-          <tr class="goalrow"><td>Goal${pace < 1 ? ` <small>(monthly totals paced to ${Math.round(pace * 100)}%)</small>` : ''}</td><td></td><td class="num">min $${minSph}</td>${METRICS.map(m => `<td class="num">${fmtGoal(m, m.monthly ? g[m.key] * pace : g[m.key])}</td>`).join('')}</tr></thead>
-          <tbody>${cards.map(c => `<tr data-id="${esc(c.id)}" class="${c.id === S.selected ? 'sel' : ''}"><td class="nm">${esc(titleName(c.name))}${c.title && c.title !== 'RSA' ? `<small>${esc(c.title)}</small>` : ''}</td>${lastCell(c.cid)}${rollCell(S.rolls[c.id])}${METRICS.map(m => {
+          <thead><tr><th>Consultant</th><th>Last 1:1</th><th class="num">Rolling SPH</th>${viewWeek ? '<th class="num">Hours</th>' : ''}${METRICS.map(m => `<th class="num">${esc(m.label)}</th>`).join('')}</tr>
+          <tr class="goalrow"><td>Goal${pace < 1 ? ` <small>(monthly totals ${viewWeek ? 'for one week' : `paced to ${Math.round(pace * 100)}%`})</small>` : ''}</td><td></td><td class="num">min $${minSph}</td>${viewWeek ? `<td class="num">${MIN_WEEK_HOURS}+ to coach</td>` : ''}${METRICS.map(m => `<td class="num">${fmtGoal(m, m.monthly ? g[m.key] * pace : g[m.key])}</td>`).join('')}</tr></thead>
+          <tbody>${shown.map(c => `<tr data-id="${esc(c.cid)}" class="${c.cid === S.selected ? 'sel' : ''}"><td class="nm">${esc(titleName(c.name))}${c.title && c.title !== 'RSA' ? `<small>${esc(c.title)}</small>` : ''}</td>${lastCell(c.cid)}${rollCell(S.rolls[c.cid])}${viewWeek ? `<td class="num">${Math.round(c.hours)}</td>` : ''}${METRICS.map(m => {
               const st = status(m, c.k[m.key], g[m.key], pace);
               return `<td class="num"><span class="val ${st}">${fmt(m, c.k[m.key])}</span></td>`;
             }).join('')}</tr>`).join('')}</tbody>
-        </table></div></div>` : `<div class="panel"><p class="muted">No consultants on file for ${esc(S.store)} in ${monthLabel(S.month)}. ${canUpload() ? 'If people are missing, check the Consultants tab to make sure they are assigned to this store.' : ''}</p></div>`)
-      + (sel ? minBanner(sel, S.rolls[sel.id], false) + consultantCard(sel) + `<div id="coach">${coachPanel('one', sel)}</div>` : '');
+        </table></div></div>` : `<div class="panel"><p class="muted">No consultants on file for ${esc(S.store)} ${viewWeek ? 'for that week' : 'in ' + monthLabel(S.month)}. ${canUpload() ? 'If people are missing, check the Consultants tab to make sure they are assigned to this store.' : ''}</p></div>`)
+      + (selShown ? minBanner(selShown, S.rolls[selShown.cid], false) + consultantCard(selShown) + (basis ? `<div id="coach">${coachPanel('one', basis)}</div>` : '') : '');
     wirePickers();
     v.querySelectorAll('[data-jump]').forEach(b => b.onclick = () => v.querySelector(`tr[data-id="${CSS.escape(b.dataset.jump)}"]`)?.click());
     v.querySelectorAll('tbody tr[data-id]').forEach(tr => tr.onclick = () => {
       S.selected = S.selected === tr.dataset.id ? null : tr.dataset.id; if (S.cstate) S.cstate.one = null;
       viewCards().then(() => { const d = $('#min-' + CSS.escape(S.selected || '')) || $('#detail-' + CSS.escape(S.selected || '')); d?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     });
-    if (sel) wireCoach('one', sel);
-    if (total) wireCoach('team', total);
+    if (basis) wireCoach('one', basis);
+    if (tBasis) wireCoach('team', tBasis);
   } catch (e) {
     v.innerHTML = pickers() + `<div class="panel"><p class="err">Could not load scorecards: ${esc(e.message)}</p></div>`; wirePickers();
   }
@@ -478,14 +569,23 @@ async function viewCards() {
 
 async function viewMine(v) {
   const cid = S.user.cid;
-  const [cards, prev, sessions] = await Promise.all([S.be.cardsForCid(S.month, cid), S.be.cardsForCid(prevMonth(S.month), cid).catch(() => []), S.be.coachingForCid(cid).catch(() => [])]);
+  const [cards, prev, sessions, weeks] = await Promise.all([S.be.cardsForCid(S.month, cid), S.be.cardsForCid(prevMonth(S.month), cid).catch(() => []),
+    S.be.coachingForCid(cid).catch(() => []), S.be.weeklyForCid(cid).catch(() => [])]);
   sessions.sort(byNewest);
+  weeks.sort((a, b) => b.week.localeCompare(a.week));
   const c = cards[0];
-  if (!c) { v.innerHTML = pickers(true) + `<div class="panel"><p>No sales on file for you in ${monthLabel(S.month)} yet.</p></div>`; wirePickers(); return; }
-  const [total, team] = await Promise.all([S.be.storeTotal(S.month, c.store).catch(() => null), S.be.teamCoaching(c.store).catch(() => [])]);
+  const wk = S.view === 'mtd' ? null : weeks.find(w => w.week === S.view);
+  if (!c && !wk) { v.innerHTML = pickers(true) + `<div class="panel"><p>No sales on file for you in ${monthLabel(S.month)} yet.</p></div>`; wirePickers(); return; }
+  const store = (c || wk).store;
+  const [total, team, storeWk, coachWk] = await Promise.all([S.be.storeTotal(S.month, store).catch(() => null), S.be.teamCoaching(store).catch(() => []),
+    S.view !== 'mtd' ? S.be.storeWeek(S.view, store).catch(() => null) : null,
+    pickStoreWeek((S.meta.weeks || [])[0], (S.meta.storeWeeks || [])[0], store)]);
   team.sort(byNewest);
-  v.innerHTML = pickers(true) + minBanner(c, rollFor(c, prev[0]), true) + myFocus(c, sessions.filter(x => !isTeam(x))[0]) + teamFocus(total, team[0])
-    + consultantCard(c) + (total ? storeCard(total) : '');
+  const basis = coachBasis(c, weeks[0]);
+  const shownCard = wk || c;
+  const shownTotal = S.view === 'mtd' ? total : storeWk;
+  v.innerHTML = pickers(true) + (c ? minBanner(c, rollFor(c, prev[0]), true) : '') + myFocus(basis, sessions.filter(x => !isTeam(x))[0])
+    + teamFocus(teamBasis(total, coachWk), team[0]) + consultantCard(shownCard) + (shownTotal ? storeCard(shownTotal) : '');
   wirePickers();
 }
 // Selling leaders (ASM, Sales Lead) with their own card.
@@ -512,28 +612,29 @@ function minBanner(c, r, own) {
   const who = own ? 'Your' : `${esc(titleName(c.name).split(' ')[0])}'s`;
   const range = `${dateLabel(r.from)} to ${dateLabel(r.to)}, ${r.days} days`;
   const outlet = isOutlet(S.goals, c.store) ? ' for outlets' : '';
-  if (r.st === 'below') return `<div class="minbanner below" id="min-${esc(c.id)}"><b>Below minimum standard.</b> ${who} rolling sales per hour is <b>$${Math.round(r.sph)}</b>. The minimum is $${r.min}${outlet}. <span class="small">(Last month plus this month: ${range}, $${Math.round(r.sales).toLocaleString('en-US')} over ${Math.round(r.hours)} hours.)</span>${own ? ' Talk with your leader this week about a plan.' : ' Address this in the 1:1 this week.'}</div>`;
-  return `<div class="minbanner watch" id="min-${esc(c.id)}"><b>Close to minimum.</b> ${who} rolling sales per hour is <b>$${Math.round(r.sph)}</b>, within 10% of the $${r.min} minimum. <span class="small">(${range}.)</span></div>`;
+  if (r.st === 'below') return `<div class="minbanner below" id="min-${esc(c.cid)}"><b>Below minimum standard.</b> ${who} rolling sales per hour is <b>$${Math.round(r.sph)}</b>. The minimum is $${r.min}${outlet}. <span class="small">(Last month plus this month: ${range}, $${Math.round(r.sales).toLocaleString('en-US')} over ${Math.round(r.hours)} hours.)</span>${own ? ' Talk with your leader this week about a plan.' : ' Address this in the 1:1 this week.'}</div>`;
+  return `<div class="minbanner watch" id="min-${esc(c.cid)}"><b>Close to minimum.</b> ${who} rolling sales per hour is <b>$${Math.round(r.sph)}</b>, within 10% of the $${r.min} minimum. <span class="small">(${range}.)</span></div>`;
 }
 
 // ---------------------------------------------------------------- cards
 function consultantCard(c) {
   const g = goalsFor(S.goals, c.store);
-  const pace = paceFactor(c.asOf);
+  const pace = paceOf(c);
+  const wk = c.period === 'week';
   const r = c.rank;
   const rk = (scope, key) => { const x = r?.[scope]?.[key]; return x ? `#${x[0]} of ${x[1]}` : ''; };
   const headline = r?.store?.netSales
     ? `<div class="rankline"><span class="rk"><b>${rk('store', 'netSales')}</b> in ${esc(c.store)}</span><span class="rk"><b>${rk('company', 'netSales')}</b> company-wide</span><span class="muted small">Net sales rank</span></div>` : '';
-  return `<section class="panel card" id="detail-${esc(c.id)}">
+  return `<section class="panel card ${wk ? 'weekcard' : ''}" id="detail-${esc(c.cid)}">
     <div class="card-head">
       <div><p class="eyebrow">${esc(c.store)}</p><h2 class="big">${esc(titleName(c.name))}</h2></div>
-      <div class="muted small">MTD ${dateLabel(c.from)} to ${dateLabel(c.asOf)} · about ${Math.round(c.hours)} hours</div>
+      <div class="muted small">${wk ? '<span class="pill">This week</span> ' : ''}${periodLabel(c)} · about ${Math.round(c.hours)} hours</div>
     </div>
     ${headline}
     <div class="tiles">${METRICS.map(m => {
       const v = c.k[m.key], goal = g[m.key];
       const st = status(m, v, goal, pace);
-      const goalTxt = goal == null ? 'No goal set' : m.monthly ? `${fmtGoal(m, goal)}/mo · pace ${fmtGoal(m, goal * pace)}` : `${m.lower ? 'At or under ' : 'Goal '}${fmtGoal(m, goal)}`;
+      const goalTxt = goal == null ? 'No goal set' : m.monthly ? (wk ? `Week goal ${fmtGoal(m, goal * pace)} (${fmtGoal(m, goal)}/mo)` : `${fmtGoal(m, goal)}/mo · pace ${fmtGoal(m, goal * pace)}`) : `${m.lower ? 'At or under ' : 'Goal '}${fmtGoal(m, goal)}`;
       return `<div class="tile ${st}"><div class="tl">${esc(m.label)}</div><div class="tv">${fmt(m, v)}</div><div class="tg">${goalTxt}</div>${r?.store?.[m.key] ? `<div class="tr">${rk('store', m.key)} store · ${rk('company', m.key)} company</div>` : ''}</div>`;
     }).join('')}</div>
   </section>`;
@@ -545,7 +646,7 @@ function storeCard(t) {
   return `<section class="panel card store">
     <div class="card-head">
       <div><p class="eyebrow">Store total · from the daily report</p><h2 class="big">${esc(t.store)}</h2></div>
-      <div class="muted small">MTD through ${dateLabel(t.asOf)}</div>
+      <div class="muted small">${t.period === 'week' ? `<span class="pill">This week</span> Week to date ${dateLabel(t.from).slice(0, 5)} to ${dateLabel(t.asOf).slice(0, 5)}` : `MTD through ${dateLabel(t.asOf)}`}</div>
     </div>
     <div class="tiles">${STORE_METRICS.map(m => {
       const v = t.k?.[m.key];
@@ -611,27 +712,30 @@ const isTeam = x => x.type === 'team';
 function goalOf(mode, subj, key) {
   const g = goalsFor(S.goals, subj.store), m = mBy(mode, key);
   if (mode === 'team') return subj.budget?.[key] ?? g[key];
-  return m.monthly ? g[key] * paceFactor(subj.asOf) : g[key];
+  return m.monthly ? g[key] * paceOf(subj) : g[key];
 }
 function focusItem(mode, subj, key) {
   const m = mBy(mode, key), v = subj.k?.[key], goal = goalOf(mode, subj, key);
   const g = goalsFor(S.goals, subj.store);
-  const x = { key, label: m.label, value: v, goal, lower: !!m.lower, ratio: m.lower ? (v ? goal / v : 2) : v / goal, perWeek: mode === 'one' && m.monthly ? Math.ceil(g[key] / 4.33) : null };
+  const x = { key, label: m.label, value: v, goal, lower: !!m.lower, ratio: m.lower ? (v ? goal / v : 2) : v / goal, perWeek: mode === 'one' && m.monthly && subj.period !== 'week' ? Math.ceil(g[key] / 4.33) : null };
   return { ...x, target: weeklyTarget(x) };
 }
 
 // How each focus item from a past session has moved since.
-function followUp(mode, session, k) {
+function followUp(mode, session, subj) {
+  const k = subj?.k;
+  const sameWeek = session.basis === 'week' && subj?.period === 'week' && subj.from === session.week;
   return (session.focus || []).map(f => {
     const m = mBy(mode, f.key); const cur = k?.[f.key];
     let st = 'none', word = 'No data';
     if (daysAgo(session.date) < 1) { st = 'none'; word = 'Set today'; }
+    else if (sameWeek) { st = 'none'; word = 'No new week of numbers yet'; }
     else if (cur !== null && cur !== undefined) {
       if (f.perWeek) { const gained = cur - f.value; st = gained >= f.target ? 'green' : gained > 0 ? 'amber' : 'red'; word = `${Math.round(gained)} since then (aim ${f.target})`; }
       else if (f.lower) { st = cur <= f.target ? 'green' : cur < f.value ? 'amber' : 'red'; word = st === 'green' ? 'Hit target' : st === 'amber' ? 'Coming down' : 'Not moving yet'; }
       else { st = cur >= f.target ? 'green' : cur > f.value ? 'amber' : 'red'; word = st === 'green' ? 'Hit target' : st === 'amber' ? 'Moving up' : 'Not moving yet'; }
     }
-    return `<div class="fu ${st}"><div><b>${esc(m.label)}</b><div class="small muted">${f.perWeek ? `Was ${fmt(m, f.value)} MTD` : `${fmt(m, f.value)} then · target ${fmt(m, f.target)}`}</div></div>
+    return `<div class="fu ${st}"><div><b>${esc(m.label)}</b><div class="small muted">${f.perWeek ? `Was ${fmt(m, f.value)} MTD` : `${fmt(m, f.value)} ${f.basis === 'week' ? 'that week' : 'then'} · target ${fmt(m, f.target)}`}</div></div>
       <div class="fu-now"><span class="val ${st}">${fmt(m, cur)}</span><div class="small">${esc(word)}</div></div></div>`;
   }).join('');
 }
@@ -642,13 +746,13 @@ function coachPanel(mode, subj) {
   const last = sessions[0];
   const own = !team && S.user.cid && subj.cid === S.user.cid;
   const coachable = canCoach(subj.store) && !own;
-  const key = team ? 'team:' + subj.store + subj.asOf : subj.id;
+  const key = (team ? 'team:' + subj.store : subj.cid) + (subj.period || 'mtd') + subj.asOf;
   S.cstate ||= {};
   if (!S.cstate[mode] || S.cstate[mode].id !== key) {
     let picks = team ? pickStoreFocus(subj, goalsFor(S.goals, subj.store)).map(p => p.key)
-      : pickFocus(subj.k, goalsFor(S.goals, subj.store), paceFactor(subj.asOf)).map(p => p.key);
+      : pickFocus(subj.k, goalsFor(S.goals, subj.store), paceOf(subj)).map(p => p.key);
     // Below the minimum standard: SPH is always focus #1.
-    if (!team && S.rolls?.[subj.id]?.st === 'below') picks = ['sph', ...picks.filter(k => k !== 'sph')].slice(0, 2);
+    if (!team && S.rolls?.[subj.cid]?.st === 'below') picks = ['sph', ...picks.filter(k => k !== 'sph')].slice(0, 2);
     S.cstate[mode] = { id: key, suggested: picks, selected: [...picks] };
   }
   const st = S.cstate[mode];
@@ -658,15 +762,16 @@ function coachPanel(mode, subj) {
   const who = team ? 'The team' : first;
   const n = last ? 1 : 0;
   if (own) return `<section class="panel coach"><p class="eyebrow">Weekly 1:1</p><p>This is your own card. Your 1:1 is run by your leader.</p>
-    ${last ? `<div class="fus">${followUp(mode, last, subj.k)}</div>` : ''}</section>`;
+    ${last ? `<div class="fus">${followUp(mode, last, subj)}</div>` : ''}</section>`;
   return `<section class="panel coach ${team ? 'team' : ''}">
     <div class="card-head"><div><p class="eyebrow">${team ? 'Weekly team coaching' : 'Weekly 1:1'}</p><h2 class="big">${team ? `Coaching the ${esc(subj.store)} team` : `Coaching ${esc(first)}`}</h2></div>
       <div class="muted small">${last ? `Last ${M.word} ${dateLabel(last.date)} with ${esc(last.coachName || last.coach)}` : `No ${M.word} on file yet`}</div></div>
+    <p class="basis ${subj.fallback ? 'fb' : ''}">${subj.fallback ? esc(subj.fallback) : subj.period === 'week' ? `Coaching on <b>${team ? 'week to date' : 'last week'}</b>: ${dateLabel(subj.from).slice(0, 5)} to ${dateLabel(subj.asOf).slice(0, 5)}${team ? '' : `, ${Math.round(subj.hours)} hours`}. Month to date is for tracking.` : 'Coaching on month to date.'}</p>
     ${team ? `<p class="small muted">Use this for the weekly team meeting or huddle. Same rule: no more than 2 things. The team sees this plan on their own cards.</p>` : ''}
 
     ${last ? `<h3>1. Follow up on last week</h3>
       <p class="small">${team ? 'The team' : 'They'} committed to: <i>${esc(last.commitment || 'nothing recorded')}</i></p>
-      <div class="fus">${followUp(mode, last, subj.k)}</div>
+      <div class="fus">${followUp(mode, last, subj)}</div>
       <p class="small muted">Start here. Ask what ${team ? 'the team' : 'they'} did, what worked, and what got in the way.</p>` : ''}
 
     <h3>${n + 1}. This week's focus <span class="muted small">(no more than 2)</span></h3>
@@ -674,10 +779,11 @@ function coachPanel(mode, subj) {
       const t = COACHING[x.key]; const m = mBy(mode, x.key); const sug = st.suggested.includes(x.key);
       const goalWord = team && subj.budget?.[x.key] != null ? 'budget' : 'goal';
       return `<div class="fcard">
-        <div class="fhead"><span class="fnum">${i + 1}</span><div><b>${esc(x.label)}</b> <span class="pill">${esc(t.pillar)}</span>${!team && x.key === 'sph' && S.rolls?.[subj.id]?.st === 'below' ? ' <span class="pill minp">Minimum standard</span>' : ''}${sug ? '' : ' <span class="pill alt">Leader pick</span>'}
-          <div class="small muted">Now ${fmt(m, x.value)} · ${goalWord} ${fmt(m, x.goal)} · ${x.perWeek ? `this week: ${x.perWeek}` : `target by next week: ${fmt(m, x.target)}`}</div></div>
+        <div class="fhead"><span class="fnum">${i + 1}</span><div><b>${esc(x.label)}</b> <span class="pill">${esc(t.pillar)}</span>${!team && x.key === 'sph' && S.rolls?.[subj.cid]?.st === 'below' ? ' <span class="pill minp">Minimum standard</span>' : ''}${sug ? '' : ' <span class="pill alt">Leader pick</span>'}
+          <div class="small muted">Now ${fmt(m, x.value)} · ${goalWord} ${fmt(m, x.goal)} · ${x.perWeek ? `this week: ${x.perWeek}` : `${subj.period === 'week' ? 'target next week' : 'target by next week'}: ${fmt(m, x.target)}`}</div></div>
           ${coachable ? `<button class="link small" data-drop="${x.key}">Remove</button>` : ''}</div>
         <p class="small">${esc(t.why)}</p>
+        ${t.source ? `<p class="src">From: ${esc(t.source)}</p>` : ''}
         <div class="small"><b>${team ? 'Ask the team' : 'Ask'}</b><ul>${t.ask.map(q => `<li>${esc(q)}</li>`).join('')}</ul></div>
         <div class="small"><b>This week</b> ${esc(t.doThis)}</div>
       </div>`;
@@ -727,8 +833,9 @@ function wireCoach(mode, subj) {
   const f = $('#' + M.p + 'Form');
   if (f) f.onsubmit = async e => {
     e.preventDefault(); stopMic();
-    const focus = st().selected.map(k => { const x = focusItem(mode, subj, k); return { key: k, label: x.label, value: x.value, goal: Math.round(x.goal * 10) / 10, target: x.target, perWeek: x.perWeek, lower: x.lower }; });
-    const base = { store: subj.store, coachName: S.user.name || S.user.email, date: todayIso(), createdAt: new Date().toISOString(), focus,
+    const basis = subj.period === 'week' ? 'week' : 'mtd';
+    const focus = st().selected.map(k => { const x = focusItem(mode, subj, k); return { key: k, label: x.label, value: x.value, goal: Math.round(x.goal * 10) / 10, target: x.target, perWeek: x.perWeek, lower: x.lower, basis }; });
+    const base = { basis, week: basis === 'week' ? subj.from : null, store: subj.store, coachName: S.user.name || S.user.email, date: todayIso(), createdAt: new Date().toISOString(), focus,
       commitment: $('#' + M.p + '_commit').value.trim(), support: $('#' + M.p + '_support').value.trim(), notes: $('#' + M.p + '_notes').value.trim() };
     try {
       await S.be.saveCoaching(team ? { ...base, type: 'team' } : { ...base, type: 'one', cid: subj.cid, name: subj.name });
@@ -740,11 +847,11 @@ function wireCoach(mode, subj) {
 
 // Consultant's own view: their latest 1:1 plan, and the store's team plan.
 function myFocus(c, session) {
-  if (!session) return '';
+  if (!session || !c) return '';
   return `<section class="panel coach mine">
     <div class="card-head"><div><p class="eyebrow">My focus this week</p><h2 class="big">${(session.focus || []).map(f => esc(f.label)).join(' + ')}</h2></div>
     <div class="muted small">From your 1:1 on ${dateLabel(session.date)} with ${esc(session.coachName || session.coach)}</div></div>
-    <div class="fus">${followUp('one', session, c.k)}</div>
+    <div class="fus">${followUp('one', session, c)}</div>
     <p><b>My plan:</b> ${esc(session.commitment || '')}</p>
     ${session.support ? `<p class="small"><b>My leader will:</b> ${esc(session.support)}</p>` : ''}
     ${session.notes ? `<p class="small muted">${esc(session.notes)}</p>` : ''}
@@ -755,11 +862,62 @@ function teamFocus(total, session) {
   return `<section class="panel coach team mine">
     <div class="card-head"><div><p class="eyebrow">Team focus this week</p><h2 class="big">${(session.focus || []).map(f => esc(f.label)).join(' + ')}</h2></div>
     <div class="muted small">${esc(session.store)} team, ${dateLabel(session.date)} with ${esc(session.coachName || session.coach)}</div></div>
-    ${total ? `<div class="fus">${followUp('team', session, total.k)}</div>` : ''}
+    ${total ? `<div class="fus">${followUp('team', session, total)}</div>` : ''}
     <p><b>Team plan:</b> ${esc(session.commitment || '')}</p>
     ${session.support ? `<p class="small"><b>Leaders will:</b> ${esc(session.support)}</p>` : ''}
     ${session.notes ? `<p class="small muted">${esc(session.notes)}</p>` : ''}
   </section>`;
+}
+
+// ---------------------------------------------------------------- coaching check (directors, exec, admin)
+async function viewRollup() {
+  const v = $('#view');
+  if (!S.month) { v.innerHTML = `<div class="panel"><p>No data yet.</p></div>`; return; }
+  v.innerHTML = `<div class="loading">Loading coaching check…</div>`;
+  try {
+    const stores = myStores();
+    const since = new Date(Date.now() - 35 * 86400000).toISOString();
+    const all = seesAll();
+    const [cards, prev, coaching] = await Promise.all([
+      all ? S.be.cardsForMonth(S.month) : Promise.all(stores.map(st => S.be.cardsForStore(S.month, st))).then(a => a.flat()),
+      all ? S.be.cardsForMonth(prevMonth(S.month)).catch(() => []) : Promise.all(stores.map(st => S.be.cardsForStore(prevMonth(S.month), st).catch(() => []))).then(a => a.flat()),
+      all ? S.be.coachingSince(since) : Promise.all(stores.map(st => S.be.coachingForStore(st))).then(a => a.flat())
+    ]);
+    const prevBy = Object.fromEntries(prev.map(c => [c.cid, c]));
+    const rows = stores.map(st => {
+      const people = cards.filter(c => c.store === st);
+      const ones = coaching.filter(x => x.store === st && !isTeam(x));
+      const lastOne = cid => ones.filter(x => x.cid === cid).sort(byNewest)[0];
+      const covered = people.filter(p => { const l = lastOne(p.cid); return l && daysAgo(l.date) <= 7; });
+      const never = people.filter(p => !lastOne(p.cid));
+      const team = coaching.filter(x => x.store === st && isTeam(x)).sort(byNewest)[0];
+      const below = people.filter(p => rollFor(p, prevBy[p.cid]).st === 'below');
+      return { st, n: people.length, covered: covered.length, pct: people.length ? covered.length / people.length : null,
+        overdue: people.length - covered.length, never: never.length, teamDays: team ? daysAgo(team.date) : null, below: below.length };
+    }).filter(r => r.n || r.teamDays !== null);
+    rows.sort((a, b) => (a.pct ?? 2) - (b.pct ?? 2));
+    const tot = rows.reduce((a, r) => ({ n: a.n + r.n, covered: a.covered + r.covered, below: a.below + r.below, teamOk: a.teamOk + (r.teamDays !== null && r.teamDays <= 7 ? 1 : 0) }), { n: 0, covered: 0, below: 0, teamOk: 0 });
+    const pctCls = p => (p === null ? 'none' : p >= 0.9 ? 'green' : p >= 0.6 ? 'amber' : 'red');
+    v.innerHTML = `
+    <div class="panel">
+      <h2>Coaching check</h2>
+      <p class="muted small">Is weekly coaching happening? A 1:1 counts if it was saved in the last 7 days. Lowest coverage first. Tap a store to open it.</p>
+      <div class="tiles rolltiles">
+        <div class="tile ${pctCls(tot.n ? tot.covered / tot.n : null)}"><div class="tl">1:1s this week</div><div class="tv">${tot.n ? Math.round(tot.covered / tot.n * 100) : 0}%</div><div class="tg">${tot.covered} of ${tot.n} consultants</div></div>
+        <div class="tile ${tot.teamOk === rows.length ? 'green' : 'amber'}"><div class="tl">Team sessions this week</div><div class="tv">${tot.teamOk} of ${rows.length}</div><div class="tg">stores</div></div>
+        <div class="tile ${tot.below ? 'red' : 'green'}"><div class="tl">Below minimum</div><div class="tv">${tot.below}</div><div class="tg">consultants under the rolling SPH minimum</div></div>
+      </div>
+    </div>
+    <div class="panel flush"><div class="scroller"><table class="grid">
+      <thead><tr><th>Store</th><th class="num">Consultants</th><th class="num">1:1 in last 7 days</th><th class="num">Overdue</th><th class="num">Never had a 1:1</th><th>Last team session</th><th class="num">Below minimum</th></tr></thead>
+      <tbody>${rows.map(r => `<tr data-store="${esc(r.st)}"><td class="nm">${esc(r.st)}</td><td class="num">${r.n}</td>
+        <td class="num"><span class="val ${pctCls(r.pct)}">${r.pct === null ? '--' : Math.round(r.pct * 100) + '%'}</span><small class="muted"> ${r.covered}/${r.n}</small></td>
+        <td class="num">${r.overdue ? `<span class="due">${r.overdue}</span>` : '0'}</td><td class="num">${r.never}</td>
+        <td>${r.teamDays === null ? '<span class="due">None yet</span>' : r.teamDays > 7 ? `<span class="due">${r.teamDays} days ago</span>` : `<span class="ok">${r.teamDays === 0 ? 'Today' : r.teamDays + ' days ago'}</span>`}</td>
+        <td class="num">${r.below ? `<span class="val red">${r.below}</span>` : '0'}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">No consultants on file yet.</td></tr>'}</tbody>
+    </table></div></div>`;
+    v.querySelectorAll('tr[data-store]').forEach(tr => tr.onclick = () => { S.store = tr.dataset.store; S.tab = 'cards'; S.selected = null; renderShell(); });
+  } catch (e) { v.innerHTML = `<div class="panel"><p class="err">Could not load the coaching check: ${esc(e.message)}</p></div>`; }
 }
 
 // ---------------------------------------------------------------- upload (weekly: RSA report + daily report)
@@ -769,12 +927,14 @@ function viewUpload() {
   $('#view').innerHTML = `
   <div class="panel">
     <h2>Upload this week's files</h2>
-    <p>Drop both files together (or one at a time):</p>
+    <p>Drop them together (or one at a time). The app reads the dates in each file name.</p>
     <ol class="small">
-      <li><b>RSA report</b> for the 1st of the month through the latest day, for example <code>rsa_report_2026-09-01_to_2026-09-28.csv</code>. Keep the dates in the file name; the app reads them.</li>
-      <li><b>Daily report</b> for the latest day, for example <code>daily-report-2026-09-28.csv</code>. The app uses its month-to-date numbers for the store totals.</li>
+      <li><b>RSA report, month to date</b> (the 1st through the latest day), for example <code>rsa_report_2026-09-01_to_2026-09-28.csv</code>. Builds the month-to-date cards for tracking.</li>
+      <li><b>RSA report, last week</b> (Monday to Sunday), for example <code>rsa_report_2026-09-21_to_2026-09-27.csv</code>. Builds the weekly numbers that 1:1s run on.</li>
+      <li><b>Daily report for Sunday</b> (the last day of that week), for example <code>daily-report-2026-09-27.csv</code>. Store totals, month to date and the full week.</li>
     </ol>
-    ${m.lastRsa || m.lastDaily ? `<ul class="muted small">${last(m.lastRsa, 'Last RSA report')}${last(m.lastDaily, 'Last daily report')}</ul>` : ''}
+    <p class="small muted">Best routine: every Monday, upload all three through Sunday. Then month to date, the week, and the store week all line up.</p>
+    ${m.lastRsa || m.lastDaily || m.lastWeekly ? `<ul class="muted small">${last(m.lastRsa, 'Last month-to-date RSA report')}${last(m.lastWeekly, 'Last weekly RSA report')}${last(m.lastDaily, 'Last daily report')}</ul>` : ''}
     <label class="drop" id="drop"><input type="file" id="file" accept=".csv,.xlsx,.xls" multiple><span><b>Choose files</b> or drag them here</span></label>
     ${DEMO ? `<p class="small">Demo: <button class="link" id="sample">load this week's sample files</button> to see the preview.</p>` : ''}
     <div id="preview"></div>
@@ -804,12 +964,48 @@ function addPending(name, rows) {
   if (heads.has('sales associate')) {
     const parsed = parseRsa(rows);
     const range = rangeFromFileName(name) || {};
-    S.pending.rsa = { file: name, parsed, from: range.from || '', to: range.to || '', assign: {} };
+    // A month-to-date file builds the tracking cards; a one-week file builds the coaching numbers.
+    const key = periodOf(range.from, range.to) === 'week' ? 'rsaWeek' : 'rsa';
+    S.pending[key] = { file: name, parsed, from: range.from || '', to: range.to || '', assign: {} };
   } else if (heads.has('segment') && heads.has('metric')) {
     S.pending.daily = { file: name, parsed: parseDailyReport(rows) };
   } else {
     toast(`${name} does not look like the RSA report or the daily report.`, true);
   }
+}
+const RSA_KEYS = ['rsa', 'rsaWeek'];
+const rsaReady = (R, dirLen) => R && !R.parsed.missing.length && R.from && R.to && dirLen > 0 && periodOf(R.from, R.to) !== 'other';
+
+function rsaSection(key, R, dir) {
+  const r = R.parsed, pf = key;
+  if (r.missing.length) return `<div class="warnbox"><b>${esc(R.file)} is missing columns:</b> ${r.missing.map(c => `<code>${c}</code>`).join(' ')}</div>`;
+  const res = resolveReportNames(r.people, dir);
+  R.res = res;
+  res.unmatched.forEach(x => { if (!(x.cid in R.assign)) { const sg = res.suggestions[x.cid]; R.assign[x.cid] = sg ? 'link:' + sg.cid : ''; } });
+  const skipped = res.matched.filter(m => m.d.store === SKIP).length;
+  const period = periodOf(R.from, R.to);
+  const openOpts = (sel, sg) => {
+    const byStore = {};
+    res.openRoster.forEach(d => (byStore[d.store] ||= []).push(d));
+    return (sg && sg.how === 'possible' ? `<option value="link:${esc(sg.cid)}" ${sel === 'link:' + sg.cid ? 'selected' : ''}>Possible match: ${esc(dir.find(d => d.cid === sg.cid).name)} (${esc(dir.find(d => d.cid === sg.cid).store)})</option>` : '')
+      + ALL_STORE_NAMES.filter(n => byStore[n]).map(n => `<optgroup label="Same person as, at ${esc(n)}">${byStore[n].map(d => `<option value="link:${esc(d.cid)}" ${sel === 'link:' + d.cid ? 'selected' : ''}>${esc(d.name)}${d.title && d.title !== 'RSA' ? ' (' + d.title + ')' : ''}</option>`).join('')}</optgroup>`).join('');
+  };
+  return `<section class="pend"><h3>RSA report, ${period === 'week' ? '<span class="pill">one week: coaching numbers</span>' : period === 'month' ? '<span class="pill">month to date: tracking</span>' : 'dates to check'} <span class="muted small">${esc(R.file)}</span></h3>
+    <div class="formgrid"><label>From<input type="date" data-rfrom="${pf}" value="${R.from}"></label><label>Through<input type="date" data-rto="${pf}" value="${R.to}"></label></div>
+    ${!R.from || !R.to ? `<div class="warnbox">The dates were not in the file name. Enter them above.</div>` : ''}
+    ${R.from && R.to && period === 'other' ? `<div class="warnbox"><b>These dates are not month to date or a single week.</b> Use the 1st of the month through the latest day, or one Monday to Sunday week.</div>` : ''}
+    ${!dir.length ? `<div class="warnbox err"><b>Load the team roster first.</b> Without it the app can't tell which store anyone works at, so nobody would show up. Go to the Consultants tab, load the Store Sales Team Contacts file, then come back.</div>` : ''}
+    <p class="small"><b>${r.people.length}</b> selling consultants. <b>${res.matched.length - skipped}</b> matched to the team roster${skipped ? `, ${skipped} marked not a consultant` : ''}. ${res.unmatched.length ? `<b class="err">${res.unmatched.length} not matched</b> (below).` : 'Everyone is matched.'}</p>
+    <p class="muted small">Left out: ${r.skipped.map(esc).join(', ') || 'none'}, plus ${r.nonSellers.length} people with no sales hours (leaders, returns only).</p>
+    ${res.unmatched.length && dir.length ? `<div class="assign">
+      <p class="small"><b>Names in the report that are not on the roster.</b> Usually a nickname, a name change, or someone new. Pick who they are on the roster, or give them a store. Suggestions are filled in; check them.</p>
+      ${res.unmatched.some(x => !res.suggestions[x.cid]) ? `<p class="small"><button class="btn tiny" data-skipall="${pf}">Leave off everyone with no match</button> <span class="muted">Sets every row without a suggestion to "Leave off, don't ask again". You can bring anyone back on the Consultants tab.</span></p>` : ''}
+      <div class="scroller"><table class="mini"><thead><tr><th>Name in report</th><th class="num">Net Sales</th><th class="num">SPH</th><th>Who is this?</th></tr></thead><tbody>
+      ${res.unmatched.sort((a, b) => b.k.netSales - a.k.netSales).map(x => { const sel = R.assign[x.cid]; const sg = res.suggestions[x.cid]; return `<tr><td>${esc(x.name)}${sg ? `<small class="sugg ${sg.how === 'possible' ? 'weak' : ''}">${sg.how === 'possible' ? 'Possible match (same last name): check it' : `Suggested by ${sg.how === 'email' ? 'work email' : 'name'}`}</small>` : ''}</td><td class="num">${fmt(METRICS[0], x.k.netSales)}</td><td class="num">${fmt(METRICS[1], x.k.sph)}</td>
+        <td><select data-assign="${pf}|${esc(x.cid)}"><option value="">Leave out for now</option><option value="${SKIP}" ${sel === SKIP ? 'selected' : ''}>Leave off, don't ask again</option>${openOpts(sel, sg)}
+        ${ALL_STORE_NAMES.map(n => `<option value="store:${esc(n)}" ${sel === 'store:' + n ? 'selected' : ''}>New person at ${esc(n)}</option>`).join('')}</select></td></tr>`; }).join('')}
+      </tbody></table></div></div>` : ''}
+  </section>`;
 }
 
 async function renderPending() {
@@ -818,100 +1014,88 @@ async function renderPending() {
   const dir = await S.be.directory();
   const dmap = Object.fromEntries(dir.map(d => [d.cid, d]));
   let html = '';
-  if (P.rsa) {
-    const r = P.rsa.parsed;
-    if (r.missing.length) html += `<div class="warnbox"><b>${esc(P.rsa.file)} is missing columns:</b> ${r.missing.map(c => `<code>${c}</code>`).join(' ')}</div>`;
-    else {
-      const res = resolveReportNames(r.people, dir);
-      P.rsa.res = res;
-      res.unmatched.forEach(x => { if (!(x.cid in P.rsa.assign)) { const sg = res.suggestions[x.cid]; P.rsa.assign[x.cid] = sg ? 'link:' + sg.cid : ''; } });
-      const skipped = res.matched.filter(m => m.d.store === SKIP).length;
-      const badStart = P.rsa.from && !P.rsa.from.endsWith('-01');
-      const openOpts = (sel, sg) => {
-        const byStore = {};
-        res.openRoster.forEach(d => (byStore[d.store] ||= []).push(d));
-        return (sg && sg.how === 'possible' ? `<option value="link:${esc(sg.cid)}" ${sel === 'link:' + sg.cid ? 'selected' : ''}>Possible match: ${esc(dir.find(d => d.cid === sg.cid).name)} (${esc(dir.find(d => d.cid === sg.cid).store)})</option>` : '')
-          + ALL_STORE_NAMES.filter(n => byStore[n]).map(n => `<optgroup label="Same person as, at ${esc(n)}">${byStore[n].map(d => `<option value="link:${esc(d.cid)}" ${sel === 'link:' + d.cid ? 'selected' : ''}>${esc(d.name)}${d.title && d.title !== 'RSA' ? ' (' + d.title + ')' : ''}</option>`).join('')}</optgroup>`).join('');
-      };
-      html += `<section class="pend"><h3>RSA report <span class="muted small">${esc(P.rsa.file)}</span></h3>
-        <div class="formgrid"><label>From<input type="date" id="r_from" value="${P.rsa.from}"></label><label>Through<input type="date" id="r_to" value="${P.rsa.to}"></label></div>
-        ${!P.rsa.from || !P.rsa.to ? `<div class="warnbox">The dates were not in the file name. Enter them above.</div>` : ''}
-        ${badStart ? `<div class="warnbox"><b>Heads up:</b> this report starts on ${dateLabel(P.rsa.from)}, not the 1st. The scorecard expects month to date.</div>` : ''}
-        <p class="small"><b>${r.people.length}</b> selling consultants. <b>${res.matched.length - skipped}</b> matched to the team roster${skipped ? `, ${skipped} marked not a consultant` : ''}. ${res.unmatched.length ? `<b class="err">${res.unmatched.length} not matched</b> (below).` : 'Everyone is matched.'}</p>
-        <p class="muted small">Left out: ${r.skipped.map(esc).join(', ') || 'none'}, plus ${r.nonSellers.length} people with no sales hours this month (leaders, returns only).</p>
-        ${!dir.length ? `<div class="warnbox">No team roster loaded yet. Load it on the Consultants tab first, then come back. Every name will match.</div>` : ''}
-        ${res.unmatched.length ? `<div class="assign">
-          <p class="small"><b>Names in the report that are not on the roster.</b> Usually a nickname, a name change, or someone new. Pick who they are on the roster, or give them a store. Suggestions are filled in; check them. Anyone on "Leave out for now" will not show this week.</p>
-          ${res.unmatched.some(x => !res.suggestions[x.cid]) ? `<p class="small"><button class="btn tiny" id="skipall">Leave off everyone with no match</button> <span class="muted">Sets every row without a suggestion to "Leave off, don't ask again". You can bring anyone back on the Consultants tab.</span></p>` : ''}
-          <div class="scroller"><table class="mini"><thead><tr><th>Name in report</th><th class="num">Net Sales</th><th class="num">SPH</th><th>Who is this?</th></tr></thead><tbody>
-          ${res.unmatched.sort((a, b) => b.k.netSales - a.k.netSales).map(x => { const sel = P.rsa.assign[x.cid]; const sg = res.suggestions[x.cid]; return `<tr><td>${esc(x.name)}${sg ? `<small class="sugg ${sg.how === 'possible' ? 'weak' : ''}">${sg.how === 'possible' ? 'Possible match (same last name): check it' : `Suggested by ${sg.how === 'email' ? 'work email' : 'name'}`}</small>` : ''}</td><td class="num">${fmt(METRICS[0], x.k.netSales)}</td><td class="num">${fmt(METRICS[1], x.k.sph)}</td>
-            <td><select data-assign="${esc(x.cid)}"><option value="">Leave out for now</option><option value="${SKIP}" ${sel === SKIP ? 'selected' : ''}>Leave off, don't ask again</option>${openOpts(sel, sg)}
-            ${ALL_STORE_NAMES.map(n => `<option value="store:${esc(n)}" ${sel === 'store:' + n ? 'selected' : ''}>New person at ${esc(n)}</option>`).join('')}</select></td></tr>`; }).join('')}
-          </tbody></table></div></div>` : ''}
-      </section>`;
-    }
-  }
+  // Answers given for the month file carry over to the week file (same people).
+  if (P.rsa && P.rsaWeek) P.rsaWeek.assign = { ...P.rsaWeek.assign, ...P.rsa.assign };
+  RSA_KEYS.forEach(k => { if (P[k]) html += rsaSection(k, P[k], dir); });
   if (P.daily) {
     const d = P.daily.parsed;
     if (d.missing.length) html += `<div class="warnbox"><b>${esc(P.daily.file)} is missing columns:</b> ${d.missing.map(c => `<code>${c}</code>`).join(' ')}</div>`;
     else {
       const missingStores = ALL_STORE_NAMES.filter(n => !d.stores.some(s => s.store === n));
       html += `<section class="pend"><h3>Daily report <span class="muted small">${esc(P.daily.file)}</span></h3>
-        <p class="small">Month to date through <b>${dateLabel(d.date)}</b>. <b>${d.stores.length} of 41</b> stores found.${missingStores.length ? ` Missing: ${missingStores.map(esc).join(', ')}.` : ''}</p>
+        <p class="small">Month to date and week to date through <b>${dateLabel(d.date)}</b>. <b>${d.stores.length} of 41</b> stores found.${missingStores.length ? ` Missing: ${missingStores.map(esc).join(', ')}.` : ''}</p>
         ${d.unknown.length ? `<div class="warnbox"><b>Not matched to a store:</b> ${d.unknown.map(esc).join(', ')}. Tell Claude so it can be added.</div>` : ''}
         <p class="muted small">Region, Online and Total rows are skipped.</p>
       </section>`;
     }
   }
-  const ready = (P.rsa && !P.rsa.parsed.missing.length && P.rsa.from && P.rsa.to) || (P.daily && !P.daily.parsed.missing.length);
-  html += (P.rsa || P.daily) ? `<div class="row"><button class="btn primary" id="pub" ${ready ? '' : 'disabled'}>Publish</button><button class="btn" id="clr">Clear</button><span id="prog" class="muted small"></span></div>` : '';
+  const anyRsa = RSA_KEYS.some(k => P[k]);
+  const blocked = RSA_KEYS.some(k => P[k] && !rsaReady(P[k], dir.length));
+  const ready = !blocked && (anyRsa || (P.daily && !P.daily.parsed.missing.length));
+  html += (anyRsa || P.daily) ? `<div class="row"><button class="btn primary" id="pub" ${ready ? '' : 'disabled'}>Publish</button><button class="btn" id="clr">Clear</button><span id="prog" class="muted small">${blocked ? 'Fix the item above to publish.' : ''}</span></div>` : '';
   p.innerHTML = html;
-  p.querySelectorAll('[data-assign]').forEach(s => s.onchange = () => { P.rsa.assign[s.dataset.assign] = s.value; });
-  const sk = $('#skipall'); if (sk) sk.onclick = () => { P.rsa.res.unmatched.forEach(x => { if (!P.rsa.res.suggestions[x.cid]) P.rsa.assign[x.cid] = SKIP; }); renderPending(); };
-  const rf = $('#r_from'), rt = $('#r_to');
-  if (rf) rf.onchange = () => { P.rsa.from = rf.value; renderPending(); };
-  if (rt) rt.onchange = () => { P.rsa.to = rt.value; renderPending(); };
+  p.querySelectorAll('[data-assign]').forEach(s => s.onchange = () => { const [k, cid] = s.dataset.assign.split('|'); P[k].assign[cid] = s.value; });
+  p.querySelectorAll('[data-skipall]').forEach(b => b.onclick = () => { const R = P[b.dataset.skipall]; R.res.unmatched.forEach(x => { if (!R.res.suggestions[x.cid]) R.assign[x.cid] = SKIP; }); renderPending(); });
+  p.querySelectorAll('[data-rfrom]').forEach(i => i.onchange = () => { P[i.dataset.rfrom].from = i.value; moveIfWeek(P, i.dataset.rfrom); renderPending(); });
+  p.querySelectorAll('[data-rto]').forEach(i => i.onchange = () => { P[i.dataset.rto].to = i.value; moveIfWeek(P, i.dataset.rto); renderPending(); });
   const clr = $('#clr'); if (clr) clr.onclick = () => { S.pending = null; viewUpload(); };
   const pub = $('#pub'); if (pub) pub.onclick = () => publishPending(dmap);
+}
+// If dates typed by hand change a file from month to week (or back), move it to the right slot.
+function moveIfWeek(P, key) {
+  const R = P[key]; const want = periodOf(R.from, R.to) === 'week' ? 'rsaWeek' : 'rsa';
+  if (want !== key && !P[want]) { P[want] = R; delete P[key]; }
+}
+
+async function resolvePeople(R, dmap) {
+  const res = R.res;
+  const resolved = new Map(res.matched.map(m => [m.p.cid, m.d]));
+  const saves = [];
+  for (const x of res.unmatched) {
+    const v = R.assign[x.cid] || '';
+    if (!v) continue;
+    if (v === SKIP) { const d = { cid: x.cid, name: x.name, store: SKIP }; saves.push(d); resolved.set(x.cid, d); dmap[x.cid] = d; }
+    else if (v.startsWith('store:')) { const d = { cid: x.cid, name: x.name, store: v.slice(6), title: 'RSA', aliases: [] }; saves.push(d); resolved.set(x.cid, d); dmap[x.cid] = d; }
+    else if (v.startsWith('link:')) {
+      const d = dmap[v.slice(5)]; if (!d) continue;
+      d.aliases = [...new Set([...(d.aliases || []), x.cid])]; saves.push(d); resolved.set(x.cid, d);
+    }
+  }
+  if (saves.length) await S.be.saveDirectory(saves);
+  const seen = new Set();
+  const people = R.parsed.people.map(x => {
+    const d = resolved.get(x.cid);
+    if (!d || d.store === SKIP || seen.has(d.cid)) return null;
+    seen.add(d.cid);
+    return { ...x, cid: d.cid, name: d.name, reportName: x.name, store: d.store, title: d.title || 'RSA' };
+  }).filter(Boolean);
+  addRanks(people);
+  return people;
 }
 
 async function publishPending(dmap) {
   const P = S.pending, b = $('#pub'); b.disabled = true;
   try {
-    let msg = [];
+    const msg = [];
     if (P.rsa && !P.rsa.parsed.missing.length) {
-      const res = P.rsa.res;
-      const byCid = { ...dmap };
-      const resolved = new Map(res.matched.map(m => [m.p.cid, m.d]));
-      const saves = [];
-      for (const x of res.unmatched) {
-        const v = P.rsa.assign[x.cid] || '';
-        if (!v) continue;
-        if (v === SKIP) { const d = { cid: x.cid, name: x.name, store: SKIP }; saves.push(d); resolved.set(x.cid, d); }
-        else if (v.startsWith('store:')) { const d = { cid: x.cid, name: x.name, store: v.slice(6), title: 'RSA', aliases: [] }; saves.push(d); resolved.set(x.cid, d); }
-        else if (v.startsWith('link:')) {
-          const d = byCid[v.slice(5)]; if (!d) continue;
-          d.aliases = [...new Set([...(d.aliases || []), x.cid])]; saves.push(d); resolved.set(x.cid, d);
-        }
-      }
-      if (saves.length) await S.be.saveDirectory(saves);
-      const seen = new Set();
-      const people = P.rsa.parsed.people.map(x => {
-        const d = resolved.get(x.cid);
-        if (!d || d.store === SKIP || seen.has(d.cid)) return null;
-        seen.add(d.cid);
-        return { ...x, cid: d.cid, name: d.name, reportName: x.name, store: d.store, title: d.title || 'RSA' };
-      }).filter(Boolean);
-      addRanks(people);
+      const people = await resolvePeople(P.rsa, dmap);
       await S.be.publishRsa({ month: P.rsa.from.slice(0, 7), from: P.rsa.from, to: P.rsa.to, people, file: P.rsa.file }, (d, t) => $('#prog').textContent = `Saving ${d} of ${t}…`);
-      msg.push(`${people.length} consultant cards`);
+      msg.push(`${people.length} month-to-date cards`);
       S.month = P.rsa.from.slice(0, 7);
+    }
+    if (P.rsaWeek && !P.rsaWeek.parsed.missing.length) {
+      // Re-run matching so links just made for the month file apply here too.
+      P.rsaWeek.res = resolveReportNames(P.rsaWeek.parsed.people, Object.values(dmap));
+      const people = await resolvePeople(P.rsaWeek, dmap);
+      await S.be.publishWeekly({ from: P.rsaWeek.from, to: P.rsaWeek.to, people, file: P.rsaWeek.file }, (d, t) => $('#prog').textContent = `Saving ${d} of ${t}…`);
+      msg.push(`${people.length} weekly cards`);
+      S.view = P.rsaWeek.from; S.viewSet = true;
     }
     if (P.daily && !P.daily.parsed.missing.length) {
       await S.be.publishDaily({ ...P.daily.parsed, file: P.daily.file });
       msg.push(`${P.daily.parsed.stores.length} store totals`);
     }
-    toast(`Published ${msg.join(' and ')}.`);
+    toast(`Published ${msg.join(', ')}.`);
     S.pending = null; await loadShared(); S.tab = 'cards'; renderShell();
   } catch (e) { b.disabled = false; toast('Publish failed: ' + e.message, true); }
 }
