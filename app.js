@@ -447,10 +447,10 @@ function pickers(mine = false) {
   const showStore = S.user.role !== 'consultant' && !mine;
   const asOf = S.meta.asOf?.[S.month], sAsOf = S.meta.storeAsOf?.[S.month];
   const weeks = S.meta.weeks || [];
-  const wkLabel = w => `Week of ${dateLabel(w).slice(0, 5)} to ${dateLabel(S.meta.weekTo?.[w] || addDaysIso(w, 6)).slice(0, 5)}`;
+  const wkLabel = w => `${dateLabel(w).slice(0, 5)} to ${dateLabel(S.meta.weekTo?.[w] || addDaysIso(w, 6)).slice(0, 5)}`;
   return `<div class="pickers">
-    <label>Numbers<select id="pv"><option value="mtd" ${S.view === 'mtd' ? 'selected' : ''}>Month to date (tracking)</option>${weeks.map(w => `<option value="${w}" ${S.view === w ? 'selected' : ''}>${wkLabel(w)} (coaching)</option>`).join('')}</select></label>
-    ${S.view === 'mtd' ? `<label>Month<select id="pm">${months.map(m => `<option value="${m}" ${m === S.month ? 'selected' : ''}>${monthLabel(m)}</option>`).join('')}</select></label>` : ''}
+    <label>Month<select id="pm">${months.map(m => `<option value="${m}" ${m === S.month ? 'selected' : ''}>${monthLabel(m)}</option>`).join('')}</select></label>
+    ${weeks.length ? `<label>Week<select id="pv">${weeks.map(w => `<option value="${w}" ${S.view === w ? 'selected' : ''}>${wkLabel(w)}</option>`).join('')}</select></label>` : ''}
     ${showStore ? `<label>Store<select id="ps">${storeOptions(myStores(), S.store)}</select></label>` : ''}
     <div class="asof">${asOf ? `Consultants through <b>${dateLabel(asOf)}</b>` : ''}${sAsOf ? `<br>Stores through <b>${dateLabel(sAsOf)}</b>` : ''}</div>
   </div>`;
@@ -461,6 +461,12 @@ function wirePickers() {
   if (pm) pm.onchange = () => { S.month = pm.value; S.selected = null; again(); };
   if (ps) ps.onchange = () => { S.store = ps.value; S.selected = null; again(); };
   if (pv) pv.onchange = () => { S.view = pv.value; again(); };
+}
+// The week shown next to month to date: the one picked, else the latest on file.
+function shownWeek() {
+  const weeks = S.meta.weeks || [];
+  if (!weeks.includes(S.view)) S.view = weeks[0] || null;
+  return S.view;
 }
 const daysAgo = iso => Math.floor((Date.now() - new Date(iso + (iso.length === 10 ? 'T12:00:00' : '')).getTime()) / 86400000);
 const todayIso = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
@@ -496,38 +502,39 @@ async function viewCards() {
     v.innerHTML = `<div class="panel"><h2>No data yet</h2><p>${canUpload() ? 'Go to Upload and drop in this week\'s files.' : 'Scorecards show up here once the first files are uploaded.'}</p></div>`;
     return;
   }
-  if (S.view !== 'mtd' && !(S.meta.weeks || []).includes(S.view)) S.view = 'mtd';
+  const viewWeek = shownWeek();
   v.innerHTML = pickers() + `<div class="loading">Loading…</div>`;
   wirePickers();
   try {
     if (S.user.role === 'consultant') return await viewMine(v);
     if (!S.store) { v.innerHTML = pickers() + `<div class="panel"><p>No stores assigned to you yet. Ask Frank to add your stores.</p></div>`; wirePickers(); return; }
     const latestWeek = (S.meta.weeks || [])[0], latestStoreWeek = (S.meta.storeWeeks || [])[0];
-    const viewWeek = S.view === 'mtd' ? null : S.view;
     const [cards, total, sessions, prev, weekCards, storeWk, viewCardsWk, viewStoreWk] = await Promise.all([
       S.be.cardsForStore(S.month, S.store), S.be.storeTotal(S.month, S.store),
       S.be.coachingForStore(S.store).catch(() => []), S.be.cardsForStore(prevMonth(S.month), S.store).catch(() => []),
       latestWeek ? S.be.weeklyForStore(latestWeek, S.store).catch(() => []) : [],
       pickStoreWeek(latestWeek, latestStoreWeek, S.store),
       viewWeek && viewWeek !== latestWeek ? S.be.weeklyForStore(viewWeek, S.store).catch(() => []) : null,
-      viewWeek && viewWeek !== latestStoreWeek ? S.be.storeWeek(viewWeek, S.store).catch(() => null) : undefined
+      viewWeek ? S.be.storeWeek(viewWeek, S.store).catch(() => null) : null
     ]);
     sessions.sort(byNewest);
     S.sessions = sessions;
     S.rolls = {};
     cards.forEach(c => { S.rolls[c.cid] = rollFor(c, prev.find(p => p.cid === c.cid)); });
-    // What the table and cards show
-    const shown = viewWeek ? (viewCardsWk || weekCards) : cards;
-    const shownTotal = viewWeek ? (viewStoreWk === undefined ? (latestStoreWeek === viewWeek ? storeWk : null) : viewStoreWk) : total;
-    shown.sort((a, b) => b.k.netSales - a.k.netSales);
+    // Week and month side by side: one row per person on either report.
+    const wkCards = viewWeek ? (viewCardsWk || weekCards) : [];
+    const wkOf = cid => wkCards.find(w => w.cid === cid) || null;
+    const moOf = cid => cards.find(c => c.cid === cid) || null;
+    const ids = [...new Set([...cards.map(c => c.cid), ...wkCards.map(w => w.cid)])];
+    const rows = ids.map(cid => ({ cid, mo: moOf(cid), wk: wkOf(cid) })).map(r => ({ ...r, any: r.mo || r.wk }));
+    rows.sort((a, b) => (b.mo?.k.netSales ?? -1) - (a.mo?.k.netSales ?? -1) || (b.wk?.k.netSales ?? 0) - (a.wk?.k.netSales ?? 0));
+    const hasWk = wkCards.length > 0;
     const g = goalsFor(S.goals, S.store);
-    const pace = viewWeek ? WEEK_PACE : paceFactor(S.meta.asOf?.[S.month]);
+    const pace = paceFactor(S.meta.asOf?.[S.month]);
     const minSph = minSphFor(S.goals, S.store);
-    const people = cards.length ? cards : shown;
-    const below = people.filter(c => S.rolls[c.cid]?.st === 'below'), watch = people.filter(c => S.rolls[c.cid]?.st === 'watch');
-    const selMonth = cards.find(c => c.cid === S.selected), selWeek = weekCards.find(c => c.cid === S.selected);
-    const selShown = shown.find(c => c.cid === S.selected) || selMonth;
-    const basis = S.selected ? coachBasis(selMonth, selWeek) : null;
+    const below = cards.filter(c => S.rolls[c.cid]?.st === 'below'), watch = cards.filter(c => S.rolls[c.cid]?.st === 'watch');
+    const selMonth = moOf(S.selected), selWeekLatest = weekCards.find(c => c.cid === S.selected), selWeekShown = wkOf(S.selected);
+    const basis = S.selected ? coachBasis(selMonth, selWeekLatest) : null;
     const tBasis = teamBasis(total, storeWk);
     const lastCell = cid => {
       const l = sessions.find(x => !isTeam(x) && x.cid === cid);
@@ -535,25 +542,34 @@ async function viewCards() {
       const d = daysAgo(l.date);
       return `<td>${d > 7 ? `<span class="due">${d} days ago</span>` : `<span class="ok">${d === 0 ? 'Today' : d + ' days ago'}</span>`}</td>`;
     };
+    const pair = (m, w, c) => {
+      const mv = c ? `<span class="val ${status(m, c.k[m.key], g[m.key], pace)}">${fmt(m, c.k[m.key])}</span>` : '<span class="val none">--</span>';
+      if (!hasWk) return `<td class="num">${mv}</td>`;
+      const wv = w ? `<span class="val ${status(m, w.k[m.key], g[m.key], WEEK_PACE)}">${fmt(m, w.k[m.key])}</span>` : '<span class="val none">--</span>';
+      return `<td class="num"><div class="stack"><div>${wv}</div><div class="mo">${mv}</div></div></td>`;
+    };
+    const goalCell = m => {
+      if (g[m.key] == null) return '<td class="num">--</td>';
+      if (!m.monthly) return `<td class="num">${fmtGoal(m, g[m.key])}</td>`;
+      return hasWk ? `<td class="num"><div class="stack"><div>${fmtGoal(m, g[m.key] * WEEK_PACE)}</div><div class="mo">${fmtGoal(m, g[m.key] * pace)}</div></div></td>` : `<td class="num">${fmtGoal(m, g[m.key] * pace)}</td>`;
+    };
+    const wkName = viewWeek ? `week of ${dateLabel(viewWeek).slice(0, 5)}` : '';
     v.innerHTML = pickers()
       + (below.length || watch.length ? `<div class="panel minpanel">
           <h2>Minimum standard: $${minSph} rolling SPH</h2>
           ${below.length ? `<p class="minrow"><span class="flag below">Below minimum</span> ${below.map(c => `<button class="link" data-jump="${esc(c.cid)}">${esc(titleName(c.name))} ($${Math.round(S.rolls[c.cid].sph)})</button>`).join(', ')}</p>` : ''}
           ${watch.length ? `<p class="minrow"><span class="flag watch">Within 10%</span> ${watch.map(c => `<button class="link" data-jump="${esc(c.cid)}">${esc(titleName(c.name))} ($${Math.round(S.rolls[c.cid].sph)})</button>`).join(', ')}</p>` : ''}
         </div>` : '')
-      + (shownTotal ? storeCard(shownTotal) : `<div class="panel"><p class="muted">No ${viewWeek ? 'week-to-date' : ''} store report on file for ${esc(S.store)} ${viewWeek ? 'for that week' : 'in ' + monthLabel(S.month)} yet.</p></div>`)
+      + (total || viewStoreWk ? storeCard(total, viewStoreWk) : `<div class="panel"><p class="muted">No store report on file for ${esc(S.store)} in ${monthLabel(S.month)} yet.</p></div>`)
       + (tBasis ? `<div id="teamcoach">${coachPanel('team', tBasis)}</div>` : '')
-      + (shown.length ? `<div class="panel flush">
-        <div class="panel-head"><h2>Consultants <span class="count">${shown.length}</span> <span class="muted small">${viewWeek ? 'this week' : 'month to date'}</span></h2><span class="muted small">Tap a name to open their card and weekly 1:1. Sorted by net sales.</span></div>
+      + (rows.length ? `<div class="panel flush">
+        <div class="panel-head"><h2>Consultants <span class="count">${rows.length}</span></h2><span class="muted small">${hasWk ? `Each box: <b>${wkName}</b> on top, <b>month to date</b> below. ` : ''}Tap a name to open their card and weekly 1:1. Sorted by MTD net sales.</span></div>
         <div class="scroller"><table class="grid">
-          <thead><tr><th>Consultant</th><th>Last 1:1</th><th class="num">Rolling SPH</th>${viewWeek ? '<th class="num">Hours</th>' : ''}${METRICS.map(m => `<th class="num">${esc(m.label)}</th>`).join('')}</tr>
-          <tr class="goalrow"><td>Goal${pace < 1 ? ` <small>(monthly totals ${viewWeek ? 'for one week' : `paced to ${Math.round(pace * 100)}%`})</small>` : ''}</td><td></td><td class="num">min $${minSph}</td>${viewWeek ? `<td class="num">${MIN_WEEK_HOURS}+ to coach</td>` : ''}${METRICS.map(m => `<td class="num">${fmtGoal(m, m.monthly ? g[m.key] * pace : g[m.key])}</td>`).join('')}</tr></thead>
-          <tbody>${shown.map(c => `<tr data-id="${esc(c.cid)}" class="${c.cid === S.selected ? 'sel' : ''}"><td class="nm">${esc(titleName(c.name))}${c.title && c.title !== 'RSA' ? `<small>${esc(c.title)}</small>` : ''}</td>${lastCell(c.cid)}${rollCell(S.rolls[c.cid])}${viewWeek ? `<td class="num">${Math.round(c.hours)}</td>` : ''}${METRICS.map(m => {
-              const st = status(m, c.k[m.key], g[m.key], pace);
-              return `<td class="num"><span class="val ${st}">${fmt(m, c.k[m.key])}</span></td>`;
-            }).join('')}</tr>`).join('')}</tbody>
-        </table></div></div>` : `<div class="panel"><p class="muted">No consultants on file for ${esc(S.store)} ${viewWeek ? 'for that week' : 'in ' + monthLabel(S.month)}. ${canUpload() ? 'If people are missing, check the Consultants tab to make sure they are assigned to this store.' : ''}</p></div>`)
-      + (selShown ? minBanner(selShown, S.rolls[selShown.cid], false) + consultantCard(selShown) + (basis ? `<div id="coach">${coachPanel('one', basis)}</div>` : '') : '');
+          <thead><tr><th>Consultant</th><th>Last 1:1</th><th class="num">Rolling SPH</th><th class="num">Hours${hasWk ? '<br><small>Wk / MTD</small>' : ''}</th>${METRICS.map(m => `<th class="num">${esc(m.label)}${hasWk ? '<br><small>Wk / MTD</small>' : ''}</th>`).join('')}</tr>
+          <tr class="goalrow"><td>Goal${pace < 1 || hasWk ? ` <small>(monthly totals ${hasWk ? 'for one week / ' : ''}paced to ${Math.round(pace * 100)}% of month)</small>` : ''}</td><td></td><td class="num">min $${minSph}</td><td class="num">${hasWk ? `${MIN_WEEK_HOURS}+ to coach` : ''}</td>${METRICS.map(goalCell).join('')}</tr></thead>
+          <tbody>${rows.map(r => `<tr data-id="${esc(r.cid)}" class="${r.cid === S.selected ? 'sel' : ''}"><td class="nm">${esc(titleName(r.any.name))}${r.any.title && r.any.title !== 'RSA' ? `<small>${esc(r.any.title)}</small>` : ''}</td>${lastCell(r.cid)}${rollCell(S.rolls[r.cid])}<td class="num">${hasWk ? `<div class="stack"><div>${r.wk ? Math.round(r.wk.hours) : '--'}</div><div class="mo">${r.mo ? Math.round(r.mo.hours) : '--'}</div></div>` : (r.mo ? Math.round(r.mo.hours) : '--')}</td>${METRICS.map(m => pair(m, r.wk, r.mo)).join('')}</tr>`).join('')}</tbody>
+        </table></div></div>` : `<div class="panel"><p class="muted">No consultants on file for ${esc(S.store)} in ${monthLabel(S.month)}. ${canUpload() ? 'If people are missing, check the Consultants tab to make sure they are assigned to this store.' : ''}</p></div>`)
+      + (S.selected && (selMonth || selWeekShown) ? (selMonth ? minBanner(selMonth, S.rolls[S.selected], false) : '') + consultantCard(selMonth, selWeekShown) + (basis ? `<div id="coach">${coachPanel('one', basis)}</div>` : '') : '');
     wirePickers();
     v.querySelectorAll('[data-jump]').forEach(b => b.onclick = () => v.querySelector(`tr[data-id="${CSS.escape(b.dataset.jump)}"]`)?.click());
     v.querySelectorAll('tbody tr[data-id]').forEach(tr => tr.onclick = () => {
@@ -569,23 +585,22 @@ async function viewCards() {
 
 async function viewMine(v) {
   const cid = S.user.cid;
+  const viewWeek = shownWeek();
   const [cards, prev, sessions, weeks] = await Promise.all([S.be.cardsForCid(S.month, cid), S.be.cardsForCid(prevMonth(S.month), cid).catch(() => []),
     S.be.coachingForCid(cid).catch(() => []), S.be.weeklyForCid(cid).catch(() => [])]);
   sessions.sort(byNewest);
   weeks.sort((a, b) => b.week.localeCompare(a.week));
   const c = cards[0];
-  const wk = S.view === 'mtd' ? null : weeks.find(w => w.week === S.view);
+  const wk = viewWeek ? weeks.find(w => w.week === viewWeek) || null : null;
   if (!c && !wk) { v.innerHTML = pickers(true) + `<div class="panel"><p>No sales on file for you in ${monthLabel(S.month)} yet.</p></div>`; wirePickers(); return; }
   const store = (c || wk).store;
   const [total, team, storeWk, coachWk] = await Promise.all([S.be.storeTotal(S.month, store).catch(() => null), S.be.teamCoaching(store).catch(() => []),
-    S.view !== 'mtd' ? S.be.storeWeek(S.view, store).catch(() => null) : null,
+    viewWeek ? S.be.storeWeek(viewWeek, store).catch(() => null) : null,
     pickStoreWeek((S.meta.weeks || [])[0], (S.meta.storeWeeks || [])[0], store)]);
   team.sort(byNewest);
   const basis = coachBasis(c, weeks[0]);
-  const shownCard = wk || c;
-  const shownTotal = S.view === 'mtd' ? total : storeWk;
   v.innerHTML = pickers(true) + (c ? minBanner(c, rollFor(c, prev[0]), true) : '') + myFocus(basis, sessions.filter(x => !isTeam(x))[0])
-    + teamFocus(teamBasis(total, coachWk), team[0]) + consultantCard(shownCard) + (shownTotal ? storeCard(shownTotal) : '');
+    + teamFocus(teamBasis(total, coachWk), team[0]) + consultantCard(c, wk) + (total || storeWk ? storeCard(total, storeWk) : '');
   wirePickers();
 }
 // Selling leaders (ASM, Sales Lead) with their own card.
@@ -617,46 +632,62 @@ function minBanner(c, r, own) {
 }
 
 // ---------------------------------------------------------------- cards
-function consultantCard(c) {
+// A tile with this week's number and month to date side by side. Either side may be missing.
+function dualTile(label, sides, foot = '', cls = '') {
+  return `<div class="tile dual ${cls}"><div class="tl">${esc(label)}</div><div class="halves">${sides.map(x => `<div class="half ${x.st}"><span class="hl">${x.tag}</span><span class="hv">${x.val}</span>${x.note ? `<span class="hg">${x.note}</span>` : ''}</div>`).join('')}</div>${foot}</div>`;
+}
+function consultantCard(mo, wk) {
+  const c = mo || wk;
   const g = goalsFor(S.goals, c.store);
-  const pace = paceOf(c);
-  const wk = c.period === 'week';
-  const r = c.rank;
+  const moPace = mo ? paceFactor(mo.asOf) : 1;
+  const r = mo?.rank || wk?.rank;
   const rk = (scope, key) => { const x = r?.[scope]?.[key]; return x ? `#${x[0]} of ${x[1]}` : ''; };
   const headline = r?.store?.netSales
-    ? `<div class="rankline"><span class="rk"><b>${rk('store', 'netSales')}</b> in ${esc(c.store)}</span><span class="rk"><b>${rk('company', 'netSales')}</b> company-wide</span><span class="muted small">Net sales rank</span></div>` : '';
-  return `<section class="panel card ${wk ? 'weekcard' : ''}" id="detail-${esc(c.cid)}">
+    ? `<div class="rankline"><span class="rk"><b>${rk('store', 'netSales')}</b> in ${esc(c.store)}</span><span class="rk"><b>${rk('company', 'netSales')}</b> company-wide</span><span class="muted small">Net sales rank${mo ? ', month to date' : ', this week'}</span></div>` : '';
+  const sub = [wk ? `Week ${dateLabel(wk.from).slice(0, 5)} to ${dateLabel(wk.asOf).slice(0, 5)}, ${Math.round(wk.hours)} hrs` : '', mo ? `MTD ${dateLabel(mo.from).slice(0, 5)} to ${dateLabel(mo.asOf).slice(0, 5)}, ${Math.round(mo.hours)} hrs` : ''].filter(Boolean).join(' · ');
+  return `<section class="panel card" id="detail-${esc(c.cid)}">
     <div class="card-head">
       <div><p class="eyebrow">${esc(c.store)}</p><h2 class="big">${esc(titleName(c.name))}</h2></div>
-      <div class="muted small">${wk ? '<span class="pill">This week</span> ' : ''}${periodLabel(c)} · about ${Math.round(c.hours)} hours</div>
+      <div class="muted small">${sub}</div>
     </div>
     ${headline}
-    <div class="tiles">${METRICS.map(m => {
-      const v = c.k[m.key], goal = g[m.key];
-      const st = status(m, v, goal, pace);
-      const goalTxt = goal == null ? 'No goal set' : m.monthly ? (wk ? `Week goal ${fmtGoal(m, goal * pace)} (${fmtGoal(m, goal)}/mo)` : `${fmtGoal(m, goal)}/mo · pace ${fmtGoal(m, goal * pace)}`) : `${m.lower ? 'At or under ' : 'Goal '}${fmtGoal(m, goal)}`;
-      return `<div class="tile ${st}"><div class="tl">${esc(m.label)}</div><div class="tv">${fmt(m, v)}</div><div class="tg">${goalTxt}</div>${r?.store?.[m.key] ? `<div class="tr">${rk('store', m.key)} store · ${rk('company', m.key)} company</div>` : ''}</div>`;
+    <div class="tiles duo">${METRICS.map(m => {
+      const goal = g[m.key];
+      const side = (card, pace, tag) => card
+        ? { tag, val: fmt(m, card.k[m.key]), st: status(m, card.k[m.key], goal, pace), note: m.monthly && goal != null ? `goal ${fmtGoal(m, goal * pace)}` : '' }
+        : { tag, val: '--', st: 'none', note: '' };
+      const shown = wk && mo ? [side(wk, WEEK_PACE, 'Week'), side(mo, moPace, 'MTD')] : [side(wk || mo, wk ? WEEK_PACE : moPace, wk ? 'Week' : 'MTD')];
+      const foot = `<div class="tg">${goal == null ? 'No goal set' : m.monthly ? `${fmtGoal(m, goal)}/mo` : `${m.lower ? 'At or under ' : 'Goal '}${fmtGoal(m, goal)}`}</div>${mo?.rank?.store?.[m.key] ? `<div class="tr">MTD ${rk('store', m.key)} store · ${rk('company', m.key)} co.</div>` : ''}`;
+      return dualTile(m.label, shown, foot);
     }).join('')}</div>
   </section>`;
 }
 
-function storeCard(t) {
+function storeCard(mo, wk) {
+  const t = mo || wk;
   const g = goalsFor(S.goals, t.store);
   const sign = x => (x > 0 ? '+' : '') + x;
+  const sub = [wk ? `Week to date ${dateLabel(wk.from).slice(0, 5)} to ${dateLabel(wk.asOf).slice(0, 5)}` : '', mo ? `MTD through ${dateLabel(mo.asOf)}` : ''].filter(Boolean).join(' · ');
   return `<section class="panel card store">
     <div class="card-head">
       <div><p class="eyebrow">Store total · from the daily report</p><h2 class="big">${esc(t.store)}</h2></div>
-      <div class="muted small">${t.period === 'week' ? `<span class="pill">This week</span> Week to date ${dateLabel(t.from).slice(0, 5)} to ${dateLabel(t.asOf).slice(0, 5)}` : `MTD through ${dateLabel(t.asOf)}`}</div>
+      <div class="muted small">${sub}</div>
     </div>
-    <div class="tiles">${STORE_METRICS.map(m => {
-      const v = t.k?.[m.key];
-      const bud = t.budget?.[m.key], vb = t.vsBudget?.[m.key], ly = t.vsLy?.[m.key];
-      let goal = bud ?? g[m.key] ?? null, goalTxt;
-      if (bud != null) goalTxt = `Budget ${fmtGoal(m, bud)} (${m.budget === 'bps' ? sign(vb) + ' bps' : sign(vb) + '%'})`;
-      else if (g[m.key] != null) goalTxt = `${m.lower ? 'At or under ' : 'Goal '}${fmtGoal(m, g[m.key])}`;
-      else goalTxt = m.key === 'traffic' ? 'Guests counted' : '';
-      const st = m.key === 'traffic' && bud == null ? 'none' : status(m, v, goal);
-      return `<div class="tile ${st} ${m.key === 'spg' ? 'hero' : ''}"><div class="tl">${esc(m.label)}</div><div class="tv">${fmt(m, v)}</div><div class="tg">${goalTxt}</div>${ly != null ? `<div class="tr">${sign(ly)}% vs LY</div>` : ''}</div>`;
+    <div class="tiles duo">${STORE_METRICS.map(m => {
+      const side = (x, tag) => {
+        if (!x) return { tag, val: '--', st: 'none', note: '' };
+        const v = x.k?.[m.key], bud = x.budget?.[m.key], vb = x.vsBudget?.[m.key], ly = x.vsLy?.[m.key];
+        const goal = bud ?? g[m.key] ?? null;
+        const st = m.key === 'traffic' && bud == null ? 'none' : status(m, v, goal);
+        const bits = [];
+        if (bud != null) bits.push(`bud ${fmtGoal(m, bud)} (${m.budget === 'bps' ? sign(vb) + ' bps' : sign(vb) + '%'})`);
+        if (ly != null) bits.push(`${sign(ly)}% LY`);
+        return { tag, val: fmt(m, v), st, note: bits.join(' · ') };
+      };
+      const shown = wk && mo ? [side(wk, 'Week'), side(mo, 'MTD')] : [side(t, wk ? 'Week' : 'MTD')];
+      const hasBud = [wk, mo].some(x => x?.budget?.[m.key] != null);
+      const foot = !hasBud && g[m.key] != null ? `<div class="tg">${m.lower ? 'At or under ' : 'Goal '}${fmtGoal(m, g[m.key])}</div>` : '';
+      return dualTile(m.label, shown, foot, m.key === 'spg' ? 'hero' : '');
     }).join('')}</div>
   </section>`;
 }
