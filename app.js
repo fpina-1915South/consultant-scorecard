@@ -367,6 +367,16 @@ async function boot() {
   });
 }
 
+// A bar across the top to go back to the Field Leader App visit this was opened from.
+function backBar() {
+  let url = null; try { url = sessionStorage.getItem('fl_back'); } catch (e) {}
+  let bar = document.getElementById('flback');
+  if (!url) { bar?.remove(); return; }
+  if (!bar) { bar = document.createElement('div'); bar.id = 'flback'; bar.style.cssText = 'position:sticky;top:0;z-index:50;background:#003B4A;color:#fff;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:14px'; document.body.prepend(bar); }
+  bar.innerHTML = `<a href="${url.replace(/"/g, '&quot;')}" id="flbackgo" style="color:#fff;font-weight:700;text-decoration:none">&larr; Back to the visit</a><button type="button" id="flbackx" style="background:none;border:0;color:#DBECF1;font-size:13px;cursor:pointer">Hide</button>`;
+  document.getElementById('flbackgo').onclick = () => { try { sessionStorage.removeItem('fl_back'); } catch (e) {} };
+  document.getElementById('flbackx').onclick = () => { try { sessionStorage.removeItem('fl_back'); } catch (e) {} bar.remove(); };
+}
 async function loadShared() {
   [S.meta, S.goals] = await Promise.all([S.be.meta(), S.be.goals()]);
   S.goals = { ...DEFAULT_GOALS, ...S.goals, standard: { ...DEFAULT_GOALS.standard, ...(S.goals?.standard || {}) } };
@@ -379,8 +389,12 @@ async function loadShared() {
   try {
     const q = new URLSearchParams(location.search), st = q.get('store'), c = q.get('c');
     if (st && stores.includes(st)) { S.store = st; S.tab = 'cards'; if (c) { S.selected = c; S.jump = true; } }
-    if (st || c) history.replaceState(null, '', location.pathname);
+    // Remember where to go back to (only the Field Leader App).
+    const back = q.get('back');
+    if (back && back.startsWith('https://fpina-1915south.github.io/field-leader-app/')) sessionStorage.setItem('fl_back', back);
+    if (st || c || back) history.replaceState(null, '', location.pathname);
   } catch (e) {}
+  backBar();
 }
 // ---------------------------------------------------------------- auth screens
 function renderSignIn(msg = '') {
