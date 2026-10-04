@@ -201,6 +201,14 @@ label.inline{flex-direction:row;align-items:center;gap:8px;margin:0}
 .rolltiles{grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
 tr[data-store]{cursor:pointer}
 tr[data-store]:hover td{background:#f7f8f8}
+.grid th.sortable{cursor:pointer;user-select:none}
+.grid th.sortable:hover{color:var(--blue)}
+.chip.on{background:var(--navy);border-color:var(--navy);color:#fff}
+.grid.mkt input{width:100%;min-width:150px}
+.grid.mkt select{min-width:200px;font-size:13px}
+.grid.mkt td{vertical-align:top}
+.mpick{margin-bottom:4px}
+.mpick h2.big{margin:0}
 .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);background:var(--navy);color:#fff;padding:12px 18px;border-radius:8px;font-size:14px;opacity:0;pointer-events:none;transition:.2s;max-width:calc(100% - 32px);box-shadow:0 6px 24px rgba(0,0,0,.2)}
 .toast.show{opacity:1;transform:translateX(-50%)}
 .toast.bad{background:var(--clay)}
