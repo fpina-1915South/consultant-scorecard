@@ -221,6 +221,7 @@ function demoBackend() {
   const cards = {}, totals = {}, dir = {}, weekly = {}, storeWeekly = {};
   let meta = { months: [], asOf: {} };
   let goals = structuredClone(DEFAULT_GOALS);
+  goals.markets = [{ name: 'Demo Market Leader', email: 'director@demo', stores: ['Tallahassee', 'Thomasville', 'Albany'] }, { name: 'Second Market', email: 'nobody@demo', stores: ['Macon', 'Dothan'] }];
   const TITLE = i => (i % 6 === 0 ? 'ASM' : i % 6 === 1 ? 'Sales Lead' : 'RSA');
   people.filter(p => p.store).forEach((p, i) => { const cid = cidOf(p.name); dir[cid] = { cid, name: p.name, store: p.store, title: TITLE(i), email: p.name.toLowerCase().replace(/[^a-z]/g, '') + '@demo', aliases: [] }; });
   const users = {
@@ -440,6 +441,7 @@ function renderShell() {
   wireSignOut();
   const tabs = [['cards', u.role === 'consultant' ? 'My scorecard' : 'Scorecards']];
   if (u.role !== 'consultant' && u.cid) tabs.push(['mine', 'My scorecard']);
+  if (myMarkets().length) tabs.push(['market', 'Market']);
   if (['admin', 'exec', 'director'].includes(u.role)) tabs.push(['rollup', 'Coaching check']);
   if (canUpload()) tabs.push(['upload', 'Upload'], ['directory', 'Consultants']);
   if (isAdmin()) tabs.push(['roster', 'Logins'], ['goals', 'Goals']);
@@ -448,7 +450,7 @@ function renderShell() {
     <nav class="tabs">${tabs.map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}">${l}</button>`).join('')}</nav>
     <div id="view"></div>`;
   document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; S.selected = null; renderShell(); });
-  ({ cards: viewCards, mine: viewMineTab, rollup: viewRollup, upload: viewUpload, directory: viewDirectory, roster: viewRoster, goals: viewGoals })[S.tab]();
+  ({ cards: viewCards, mine: viewMineTab, market: viewMarket, rollup: viewRollup, upload: viewUpload, directory: viewDirectory, roster: viewRoster, goals: viewGoals })[S.tab]();
 }
 
 // ---------------------------------------------------------------- scorecards
@@ -467,7 +469,7 @@ function pickers(mine = false) {
 }
 function wirePickers() {
   const pm = $('#pm'), ps = $('#ps'), pv = $('#pv');
-  const again = () => (S.tab === 'mine' ? viewMineTab() : viewCards());
+  const again = () => (S.tab === 'mine' ? viewMineTab() : S.tab === 'market' ? viewMarket() : viewCards());
   if (pm) pm.onchange = () => { S.month = pm.value; S.selected = null; again(); };
   if (ps) ps.onchange = () => { S.store = ps.value; S.selected = null; again(); };
   if (pv) pv.onchange = () => { S.view = pv.value; again(); };
@@ -527,7 +529,7 @@ async function viewCards() {
       S.be.cardsForStore(S.month, S.store), S.be.storeTotal(S.month, S.store),
       S.be.coachingForStore(S.store).catch(() => []), S.be.cardsForStore(prevMonth(S.month), S.store).catch(() => []),
       latestWeek ? S.be.weeklyForStore(latestWeek, S.store).catch(() => []) : [],
-      pickStoreWeek(latestWeek, latestStoreWeek, S.store),
+      null,
       viewWeek && viewWeek !== latestWeek ? S.be.weeklyForStore(viewWeek, S.store).catch(() => []) : null,
       viewWeek ? S.be.storeWeek(viewWeek, S.store).catch(() => null) : null
     ]);
@@ -549,7 +551,6 @@ async function viewCards() {
     const below = cards.filter(c => S.rolls[c.cid]?.st === 'below'), watch = cards.filter(c => S.rolls[c.cid]?.st === 'watch');
     const selMonth = moOf(S.selected), selWeekLatest = weekCards.find(c => c.cid === S.selected), selWeekShown = wkOf(S.selected);
     const basis = S.selected ? coachBasis(selMonth, selWeekLatest) : null;
-    const tBasis = teamBasis(total, storeWk);
     const lastCell = cid => {
       const l = sessions.find(x => !isTeam(x) && x.cid === cid);
       if (!l) return `<td><span class="due">No 1:1 yet</span></td>`;
@@ -575,7 +576,6 @@ async function viewCards() {
           ${watch.length ? `<p class="minrow"><span class="flag watch">Within 10%</span> ${watch.map(c => `<button class="link" data-jump="${esc(c.cid)}">${esc(titleName(c.name))} ($${Math.round(S.rolls[c.cid].sph)})</button>`).join(', ')}</p>` : ''}
         </div>` : '')
       + (total || viewStoreWk ? storeCard(total, viewStoreWk) : `<div class="panel"><p class="muted">No store report on file for ${esc(S.store)} in ${monthLabel(S.month)} yet.</p></div>`)
-      + (tBasis ? `<div id="teamcoach">${coachPanel('team', tBasis)}</div>` : '')
       + (rows.length ? `<div class="panel flush">
         <div class="panel-head"><h2>Consultants <span class="count">${rows.length}</span></h2><span class="muted small">${hasWk ? `Each box: <b>${wkName}</b> on top, <b>month to date</b> below. ` : ''}Tap a name to open their card and weekly 1:1. Sorted by MTD net sales.</span></div>
         <div class="scroller"><table class="grid">
@@ -591,7 +591,7 @@ async function viewCards() {
       viewCards().then(() => { const d = $('#min-' + CSS.escape(S.selected || '')) || $('#detail-' + CSS.escape(S.selected || '')); d?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     });
     if (basis) wireCoach('one', basis);
-    if (tBasis) wireCoach('team', tBasis);
+    if (S.jump) { S.jump = false; ($('#min-' + CSS.escape(S.selected || '')) || $('#detail-' + CSS.escape(S.selected || '')))?.scrollIntoView({ block: 'start' }); }
   } catch (e) {
     v.innerHTML = pickers() + `<div class="panel"><p class="err">Could not load scorecards: ${esc(e.message)}</p></div>`; wirePickers();
   }
@@ -608,13 +608,11 @@ async function viewMine(v) {
   const wk = viewWeek ? weeks.find(w => w.week === viewWeek) || null : null;
   if (!c && !wk) { v.innerHTML = pickers(true) + `<div class="panel"><p>No sales on file for you in ${monthLabel(S.month)} yet.</p></div>`; wirePickers(); return; }
   const store = (c || wk).store;
-  const [total, team, storeWk, coachWk] = await Promise.all([S.be.storeTotal(S.month, store).catch(() => null), S.be.teamCoaching(store).catch(() => []),
-    viewWeek ? S.be.storeWeek(viewWeek, store).catch(() => null) : null,
-    pickStoreWeek((S.meta.weeks || [])[0], (S.meta.storeWeeks || [])[0], store)]);
-  team.sort(byNewest);
+  const [total, storeWk] = await Promise.all([S.be.storeTotal(S.month, store).catch(() => null),
+    viewWeek ? S.be.storeWeek(viewWeek, store).catch(() => null) : null]);
   const basis = coachBasis(c, weeks[0]);
   v.innerHTML = pickers(true) + (c ? minBanner(c, rollFor(c, prev[0]), true) : '') + myFocus(basis, sessions.filter(x => !isTeam(x))[0])
-    + teamFocus(teamBasis(total, coachWk), team[0]) + consultantCard(c, wk) + (total || storeWk ? storeCard(total, storeWk) : '');
+    + consultantCard(c, wk) + (total || storeWk ? storeCard(total, storeWk) : '');
   wirePickers();
 }
 // Selling leaders (ASM, Sales Lead) with their own card.
@@ -935,13 +933,12 @@ async function viewRollup() {
       const lastOne = cid => ones.filter(x => x.cid === cid).sort(byNewest)[0];
       const covered = people.filter(p => { const l = lastOne(p.cid); return l && daysAgo(l.date) <= 7; });
       const never = people.filter(p => !lastOne(p.cid));
-      const team = coaching.filter(x => x.store === st && isTeam(x)).sort(byNewest)[0];
       const below = people.filter(p => rollFor(p, prevBy[p.cid]).st === 'below');
       return { st, n: people.length, covered: covered.length, pct: people.length ? covered.length / people.length : null,
-        overdue: people.length - covered.length, never: never.length, teamDays: team ? daysAgo(team.date) : null, below: below.length };
-    }).filter(r => r.n || r.teamDays !== null);
+        overdue: people.length - covered.length, never: never.length, below: below.length };
+    }).filter(r => r.n);
     rows.sort((a, b) => (a.pct ?? 2) - (b.pct ?? 2));
-    const tot = rows.reduce((a, r) => ({ n: a.n + r.n, covered: a.covered + r.covered, below: a.below + r.below, teamOk: a.teamOk + (r.teamDays !== null && r.teamDays <= 7 ? 1 : 0) }), { n: 0, covered: 0, below: 0, teamOk: 0 });
+    const tot = rows.reduce((a, r) => ({ n: a.n + r.n, covered: a.covered + r.covered, below: a.below + r.below }), { n: 0, covered: 0, below: 0 });
     const pctCls = p => (p === null ? 'none' : p >= 0.9 ? 'green' : p >= 0.6 ? 'amber' : 'red');
     v.innerHTML = `
     <div class="panel">
@@ -949,17 +946,15 @@ async function viewRollup() {
       <p class="muted small">Is weekly coaching happening? A 1:1 counts if it was saved in the last 7 days. Lowest coverage first. Tap a store to open it.</p>
       <div class="tiles rolltiles">
         <div class="tile ${pctCls(tot.n ? tot.covered / tot.n : null)}"><div class="tl">1:1s this week</div><div class="tv">${tot.n ? Math.round(tot.covered / tot.n * 100) : 0}%</div><div class="tg">${tot.covered} of ${tot.n} consultants</div></div>
-        <div class="tile ${tot.teamOk === rows.length ? 'green' : 'amber'}"><div class="tl">Team sessions this week</div><div class="tv">${tot.teamOk} of ${rows.length}</div><div class="tg">stores</div></div>
         <div class="tile ${tot.below ? 'red' : 'green'}"><div class="tl">Below minimum</div><div class="tv">${tot.below}</div><div class="tg">consultants under the rolling SPH minimum</div></div>
       </div>
     </div>
     <div class="panel flush"><div class="scroller"><table class="grid">
-      <thead><tr><th>Store</th><th class="num">Consultants</th><th class="num">1:1 in last 7 days</th><th class="num">Overdue</th><th class="num">Never had a 1:1</th><th>Last team session</th><th class="num">Below minimum</th></tr></thead>
+      <thead><tr><th>Store</th><th class="num">Consultants</th><th class="num">1:1 in last 7 days</th><th class="num">Overdue</th><th class="num">Never had a 1:1</th><th class="num">Below minimum</th></tr></thead>
       <tbody>${rows.map(r => `<tr data-store="${esc(r.st)}"><td class="nm">${esc(r.st)}</td><td class="num">${r.n}</td>
         <td class="num"><span class="val ${pctCls(r.pct)}">${r.pct === null ? '--' : Math.round(r.pct * 100) + '%'}</span><small class="muted"> ${r.covered}/${r.n}</small></td>
         <td class="num">${r.overdue ? `<span class="due">${r.overdue}</span>` : '0'}</td><td class="num">${r.never}</td>
-        <td>${r.teamDays === null ? '<span class="due">None yet</span>' : r.teamDays > 7 ? `<span class="due">${r.teamDays} days ago</span>` : `<span class="ok">${r.teamDays === 0 ? 'Today' : r.teamDays + ' days ago'}</span>`}</td>
-        <td class="num">${r.below ? `<span class="val red">${r.below}</span>` : '0'}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">No consultants on file yet.</td></tr>'}</tbody>
+        <td class="num">${r.below ? `<span class="val red">${r.below}</span>` : '0'}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">No consultants on file yet.</td></tr>'}</tbody>
     </table></div></div>`;
     v.querySelectorAll('tr[data-store]').forEach(tr => tr.onclick = () => { S.store = tr.dataset.store; S.tab = 'cards'; S.selected = null; renderShell(); });
   } catch (e) { v.innerHTML = `<div class="panel"><p class="err">Could not load the coaching check: ${esc(e.message)}</p></div>`; }
@@ -1326,6 +1321,120 @@ function cleanUser({ email, name, role, stores, consultant, canUpload }, dir) {
   return u;
 }
 
+// ---------------------------------------------------------------- markets (market leaders)
+// Markets live in config/goals: [{ name, email, stores: [...] }]. A market leader sees their own market;
+// admin, exec and directors can pick any market.
+function myMarkets() {
+  const all = (S.goals?.markets || []).filter(m => m.stores?.length);
+  if (!S.user) return [];
+  if (['admin', 'exec', 'director'].includes(S.user.role)) return all;
+  return all.filter(m => (m.email || '').toLowerCase() === S.user.email);
+}
+function marketEditor(list) {
+  return `<div class="scroller"><table class="grid mkt"><thead><tr><th>Market leader</th><th>Email</th><th>Stores <small>(hold Ctrl or Cmd to pick several)</small></th><th></th></tr></thead><tbody>${list.map((m, i) => `<tr data-mk="${i}">
+    <td><input name="mk_name" value="${esc(m.name || '')}" placeholder="Name"></td>
+    <td><input name="mk_email" value="${esc(m.email || '')}" placeholder="name@1915south.com"></td>
+    <td><select name="mk_stores" multiple size="6">${STORES.map(st => `<option value="${esc(st.name)}" ${(m.stores || []).includes(st.name) ? 'selected' : ''}>${esc(st.name)}</option>`).join('')}</select><small class="muted"> ${(m.stores || []).length} stores</small></td>
+    <td><button type="button" class="link danger" data-mkdel="${i}">Remove</button></td></tr>`).join('')}</tbody></table></div>`;
+}
+function readMarkets() {
+  return [...document.querySelectorAll('#mkts tr[data-mk]')].map(tr => ({
+    name: tr.querySelector('[name=mk_name]').value.trim(),
+    email: tr.querySelector('[name=mk_email]').value.trim().toLowerCase(),
+    stores: [...tr.querySelector('[name=mk_stores]').selectedOptions].map(o => o.value)
+  })).filter(m => m.name || m.stores.length);
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest?.('[data-mkdel]'); if (!b) return;
+  const cur = readMarkets(); cur.splice(Number(b.dataset.mkdel), 1); $('#mkts').innerHTML = marketEditor(cur);
+});
+
+async function viewMarket() {
+  const v = $('#view');
+  const markets = myMarkets();
+  if (!S.month || !markets.length) { v.innerHTML = `<div class="panel"><p>No market set up yet.</p></div>`; return; }
+  if (!markets.some(m => m.name === S.market)) S.market = (markets.find(m => (m.email || '').toLowerCase() === S.user.email) || markets[0]).name;
+  const mk = markets.find(m => m.name === S.market);
+  const viewWeek = shownWeek();
+  const head = () => `<div class="pickers mpick">${markets.length > 1 ? `<label>Market<select id="pmk">${markets.map(m => `<option ${m.name === S.market ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></label>` : `<div><p class="eyebrow">Market</p><h2 class="big">${esc(mk.name)}</h2></div>`}</div>` + pickers(true);
+  const wire = () => { wirePickers(); const pk = $('#pmk'); if (pk) pk.onchange = () => { S.market = pk.value; viewMarket(); }; };
+  v.innerHTML = head() + `<div class="loading">Loading ${esc(mk.name)}…</div>`; wire();
+  try {
+    const stores = mk.stores;
+    const each = (fn) => Promise.all(stores.map(st => fn(st).catch(() => null)));
+    const [cards, prev, wkCards, totals, wkTotals, coaching] = await Promise.all([
+      each(st => S.be.cardsForStore(S.month, st)), each(st => S.be.cardsForStore(prevMonth(S.month), st)),
+      viewWeek ? each(st => S.be.weeklyForStore(viewWeek, st)) : [], each(st => S.be.storeTotal(S.month, st)),
+      viewWeek ? each(st => S.be.storeWeek(viewWeek, st)) : [], each(st => S.be.coachingForStore(st))
+    ]);
+    const flat = a => (a || []).flat().filter(Boolean);
+    const mo = flat(cards), pv = flat(prev), wk = flat(wkCards), co = flat(coaching).filter(x => !isTeam(x));
+    const prevBy = Object.fromEntries(pv.map(c => [c.cid, c]));
+    const hasWk = wk.length > 0;
+    const pace = paceFactor(S.meta.asOf?.[S.month]);
+    const pct = x => (x === null || x === undefined ? '--' : (x > 0 ? '+' : '') + x + '%');
+    // ---- stores
+    const srows = stores.map((st, i) => {
+      const t = totals[i], w = wkTotals[i] || null;
+      const people = mo.filter(c => c.store === st);
+      const covered = people.filter(p => { const l = co.filter(x => x.cid === p.cid).sort(byNewest)[0]; return l && daysAgo(l.date) <= 7; }).length;
+      const below = people.filter(p => rollFor(p, prevBy[p.cid]).st === 'below').length;
+      return { st, t, w, n: people.length, covered, cov: people.length ? covered / people.length : null, below };
+    });
+    const sk = S.mSort || { key: 'netSalesVb', dir: -1 };
+    const sval = { store: r => r.st, netSales: r => r.t?.k?.netSales, netSalesVb: r => r.t?.vsBudget?.netSales, spg: r => r.t?.k?.spg, closeRate: r => r.t?.k?.closeRate, sph: r => r.t?.k?.sph,
+      wkNet: r => r.w?.k?.netSales, wkSpg: r => r.w?.k?.spg, n: r => r.n, cov: r => r.cov, below: r => r.below };
+    const sorted = (rows, vals, k) => [...rows].sort((a, b) => { const x = vals[k.key](a), y = vals[k.key](b); if (x == null && y == null) return 0; if (x == null) return 1; if (y == null) return -1; return (typeof x === 'string' ? x.localeCompare(y) : x - y) * k.dir; });
+    const th = (key, label, set, cur, num = true) => `<th class="${num ? 'num ' : ''}sortable" data-${set}="${key}">${label}${cur.key === key ? (cur.dir < 0 ? ' ▼' : ' ▲') : ''}</th>`;
+    const SM = Object.fromEntries(STORE_METRICS.map(m => [m.key, m]));
+    const stCell = (t, key) => { const m = SM[key]; if (!t?.k) return '<span class="val none">--</span>'; const bud = t.budget?.[key]; const g = goalsFor(S.goals, t.store); return `<span class="val ${status(m, t.k[key], bud ?? g[key] ?? null)}">${fmt(m, t.k[key])}</span>`; };
+    const covCls = p => (p === null ? 'none' : p >= 0.9 ? 'green' : p >= 0.6 ? 'amber' : 'red');
+    const tot = srows.reduce((a, r) => ({ ns: a.ns + (r.t?.k?.netSales || 0), bud: a.bud + (r.t?.budget?.netSales || 0), n: a.n + r.n, covered: a.covered + r.covered, below: a.below + r.below }), { ns: 0, bud: 0, n: 0, covered: 0, below: 0 });
+    // ---- consultants
+    const ids = [...new Set([...mo.map(c => c.cid), ...wk.map(c => c.cid)])];
+    const people = ids.map(cid => { const m = mo.find(c => c.cid === cid) || null, w = wk.find(c => c.cid === cid) || null; return { cid, m, w, any: m || w, roll: m ? rollFor(m, prevBy[cid]) : null }; });
+    const ck = S.mcSort || { key: 'netSales', dir: -1 };
+    const basisOf = r => (S.mcBasis === 'week' ? r.w : r.m);
+    const cvals = { name: r => titleName(r.any.name), store: r => r.any.store, roll: r => r.roll?.sph, hours: r => basisOf(r)?.hours, ...Object.fromEntries(METRICS.map(m => [m.key, r => basisOf(r)?.k?.[m.key]])) };
+    const cell = (m, c, wkly) => { if (!c) return '<span class="val none">--</span>'; const g = goalsFor(S.goals, c.store); return `<span class="val ${status(m, c.k[m.key], g[m.key], wkly ? WEEK_PACE : pace)}">${fmt(m, c.k[m.key])}</span>`; };
+    const pair = (m, r) => hasWk ? `<td class="num"><div class="stack"><div>${cell(m, r.w, true)}</div><div class="mo">${cell(m, r.m, false)}</div></div></td>` : `<td class="num">${cell(m, r.m, false)}</td>`;
+    v.innerHTML = head() + `
+      <div class="panel">
+        <div class="tiles rolltiles">
+          <div class="tile ${tot.bud ? (tot.ns >= tot.bud ? 'green' : tot.ns >= tot.bud * 0.8 ? 'amber' : 'red') : 'none'}"><div class="tl">Net sales MTD</div><div class="tv">$${Math.round(tot.ns).toLocaleString('en-US')}</div><div class="tg">${tot.bud ? `Budget $${Math.round(tot.bud).toLocaleString('en-US')} (${pct(Math.round((tot.ns / tot.bud - 1) * 1000) / 10)})` : ''}</div></div>
+          <div class="tile ${covCls(tot.n ? tot.covered / tot.n : null)}"><div class="tl">1:1s this week</div><div class="tv">${tot.n ? Math.round(tot.covered / tot.n * 100) : 0}%</div><div class="tg">${tot.covered} of ${tot.n} consultants</div></div>
+          <div class="tile ${tot.below ? 'red' : 'green'}"><div class="tl">Below minimum</div><div class="tv">${tot.below}</div><div class="tg">consultants under the rolling SPH minimum</div></div>
+        </div>
+      </div>
+      <div class="panel flush">
+        <div class="panel-head"><h2>Stores <span class="count">${stores.length}</span></h2><span class="muted small">Tap a column to sort. Tap a store to open it.</span></div>
+        <div class="scroller"><table class="grid">
+          <thead><tr>${th('store', 'Store', 'ss', sk, false)}${th('netSales', 'Net sales MTD', 'ss', sk)}${th('netSalesVb', 'vs budget', 'ss', sk)}${th('spg', 'SPG w/ canc.', 'ss', sk)}${th('closeRate', 'Close rate', 'ss', sk)}${th('sph', 'SPH', 'ss', sk)}${viewWeek ? th('wkNet', 'Week net sales', 'ss', sk) + th('wkSpg', 'Week SPG', 'ss', sk) : ''}${th('n', 'Consultants', 'ss', sk)}${th('cov', '1:1s this week', 'ss', sk)}${th('below', 'Below min', 'ss', sk)}</tr></thead>
+          <tbody>${sorted(srows, sval, sk).map(r => `<tr data-store="${esc(r.st)}"><td class="nm">${esc(r.st)}</td>
+            <td class="num">${stCell(r.t, 'netSales')}</td><td class="num">${pct(r.t?.vsBudget?.netSales)}</td><td class="num">${stCell(r.t, 'spg')}</td><td class="num">${stCell(r.t, 'closeRate')}</td><td class="num">${stCell(r.t, 'sph')}</td>
+            ${viewWeek ? `<td class="num">${stCell(r.w, 'netSales')}</td><td class="num">${stCell(r.w, 'spg')}</td>` : ''}
+            <td class="num">${r.n}</td><td class="num"><span class="val ${covCls(r.cov)}">${r.cov === null ? '--' : Math.round(r.cov * 100) + '%'}</span><small class="muted"> ${r.covered}/${r.n}</small></td>
+            <td class="num">${r.below ? `<span class="val red">${r.below}</span>` : '0'}</td></tr>`).join('')}</tbody>
+        </table></div>
+      </div>
+      <div class="panel flush">
+        <div class="panel-head"><h2>Consultants in ${esc(mk.name)} <span class="count">${people.length}</span></h2>
+          <span class="muted small">${hasWk ? `Week on top, month to date below. Sort on <button class="chip ${S.mcBasis !== 'week' ? 'on' : ''}" data-basis="mtd">MTD</button> <button class="chip ${S.mcBasis === 'week' ? 'on' : ''}" data-basis="week">Week</button> ` : ''}Tap a column to sort, a name to open their card.</span></div>
+        <div class="scroller"><table class="grid">
+          <thead><tr>${th('name', 'Consultant', 'cs', ck, false)}${th('store', 'Store', 'cs', ck, false)}${th('roll', 'Rolling SPH', 'cs', ck)}${th('hours', 'Hours', 'cs', ck)}${METRICS.map(m => th(m.key, esc(m.label), 'cs', ck)).join('')}</tr></thead>
+          <tbody>${sorted(people, cvals, ck).map(r => `<tr data-id="${esc(r.cid)}" data-st="${esc(r.any.store)}"><td class="nm">${esc(titleName(r.any.name))}${r.any.title && r.any.title !== 'RSA' ? `<small>${esc(r.any.title)}</small>` : ''}</td><td>${esc(r.any.store)}</td>${rollCell(r.roll)}
+            <td class="num">${hasWk ? `<div class="stack"><div>${r.w ? Math.round(r.w.hours) : '--'}</div><div class="mo">${r.m ? Math.round(r.m.hours) : '--'}</div></div>` : (r.m ? Math.round(r.m.hours) : '--')}</td>${METRICS.map(m => pair(m, r)).join('')}</tr>`).join('')}</tbody>
+        </table></div>
+      </div>`;
+    wire();
+    v.querySelectorAll('[data-ss]').forEach(h => h.onclick = () => { const k = h.dataset.ss; S.mSort = { key: k, dir: sk.key === k ? -sk.dir : (k === 'store' ? 1 : -1) }; viewMarket(); });
+    v.querySelectorAll('[data-cs]').forEach(h => h.onclick = () => { const k = h.dataset.cs; const lowFirst = ['name', 'store'].includes(k) || metricBy(k)?.lower; S.mcSort = { key: k, dir: ck.key === k ? -ck.dir : (lowFirst ? 1 : -1) }; viewMarket(); });
+    v.querySelectorAll('[data-basis]').forEach(b => b.onclick = () => { S.mcBasis = b.dataset.basis; viewMarket(); });
+    v.querySelectorAll('tr[data-store]').forEach(tr => tr.onclick = () => { S.store = tr.dataset.store; S.tab = 'cards'; S.selected = null; renderShell(); });
+    v.querySelectorAll('tbody tr[data-id]').forEach(tr => tr.onclick = () => { S.store = tr.dataset.st; S.tab = 'cards'; S.selected = tr.dataset.id; S.jump = true; renderShell(); });
+  } catch (e) { v.innerHTML = head() + `<div class="panel"><p class="err">Could not load the market: ${esc(e.message)}</p></div>`; wire(); }
+}
+
 // ---------------------------------------------------------------- goals (admin)
 function viewGoals() {
   const g = S.goals;
@@ -1349,8 +1458,13 @@ function viewGoals() {
     <h3>Outlet stores</h3>
     <p class="muted small">Checked stores use the Outlet column and the outlet minimum. Blank outlet cells fall back to standard.</p>
     <div class="checks">${STORES.map(st => `<label class="check"><input type="checkbox" name="os" value="${esc(st.name)}" ${set.has(st.name) ? 'checked' : ''}> ${esc(st.name)}</label>`).join('')}</div>
-    <div class="row"><button class="btn primary">Save goals</button></div>
+    <h3>Markets</h3>
+    <p class="muted small">Each market leader's stores. This drives the Market tab: a market leader sees their market there, and directors, exec and admin can pick any market. It does not change who can see which stores (that is on the Logins tab).</p>
+    <div id="mkts">${marketEditor(g.markets || [])}</div>
+    <div class="row"><button type="button" class="btn tiny" id="mkadd">Add a market</button></div>
+    <div class="row"><button class="btn primary">Save goals and markets</button></div>
   </form>`;
+  $('#mkadd').onclick = () => { const cur = readMarkets(); cur.push({ name: '', email: '', stores: [] }); $('#mkts').innerHTML = marketEditor(cur); };
   $('#gf').onsubmit = async e => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -1360,7 +1474,7 @@ function viewGoals() {
       standard[m.key] = s === '' ? null : Number(s);
       if (ov !== '' && ov !== null) o[m.key] = Number(ov);
     });
-    const goals = { standard, outlet: Object.keys(o).length ? o : null, outletStores: fd.getAll('os'),
+    const goals = { standard, outlet: Object.keys(o).length ? o : null, outletStores: fd.getAll('os'), markets: readMarkets(),
       minSph: Number(fd.get('minSph')) || 250, outletMinSph: Number(fd.get('outletMinSph')) || 150 };
     await S.be.saveGoals(goals); await loadShared(); toast('Goals saved.');
   };
