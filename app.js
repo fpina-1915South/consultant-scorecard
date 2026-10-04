@@ -375,6 +375,12 @@ async function loadShared() {
   if (!S.viewSet && (S.meta.weeks || []).length) { S.view = S.meta.weeks[0]; S.viewSet = true; }
   const stores = myStores();
   if (!S.store || !stores.includes(S.store)) S.store = stores[0] || null;
+  // Opened from the Field Leader App: ?store=Harahan&c=<consultant id> goes straight to that consultant's card.
+  try {
+    const q = new URLSearchParams(location.search), st = q.get('store'), c = q.get('c');
+    if (st && stores.includes(st)) { S.store = st; S.tab = 'cards'; if (c) { S.selected = c; S.jump = true; } }
+    if (st || c) history.replaceState(null, '', location.pathname);
+  } catch (e) {}
 }
 // ---------------------------------------------------------------- auth screens
 function renderSignIn(msg = '') {
