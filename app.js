@@ -173,6 +173,37 @@ async function firebaseBackend() {
     deleteUser: e => F.deleteDoc(F.doc(db, 'users', e)),
     saveUsers: list2 => batchWrite(list2.map(u => ['set', 'users', u.email, u]))
   };
+  return withReadCache(be);
+}
+
+// Read cache. The numbers only change when someone uploads, so each browser reads a query from
+// Firestore once and reuses it while the person clicks around, instead of re-reading on every tap.
+// This keeps the app well inside the free plan's 50,000 reads a day. Any save or upload from this
+// browser clears the cache, and everything expires after 30 minutes so other people's saves show up.
+const CACHE_READS = ['meta', 'goals', 'cardsForStore', 'cardsForCid', 'storeTotal', 'weeklyForStore', 'weeklyForCid', 'storeWeek', 'cardsForMonth',
+  'coachingSince', 'directory', 'coachingForStore', 'coachingForCid', 'coachingByCoach', 'teamCoaching', 'users'];
+const CACHE_WRITES = ['saveGoals', 'publishRsa', 'publishDaily', 'publishWeekly', 'saveMeta', 'saveDirectory', 'deleteDirectory',
+  'saveCoaching', 'deleteCoaching', 'saveUser', 'deleteUser', 'saveUsers'];
+function withReadCache(be, ttl = 30 * 60 * 1000) {
+  const memo = new Map();
+  const copy = x => (x == null ? x : structuredClone(x));
+  CACHE_READS.filter(n => typeof be[n] === 'function').forEach(n => {
+    const fn = be[n];
+    be[n] = (...a) => {
+      const k = n + JSON.stringify(a), hit = memo.get(k);
+      if (hit && Date.now() - hit.t < ttl) return hit.p.then(copy);
+      const p = Promise.resolve().then(() => fn.apply(be, a));
+      memo.set(k, { t: Date.now(), p });
+      p.catch(() => memo.delete(k));
+      return p.then(copy);
+    };
+  });
+  // Clear before (so uploads read fresh) and after (so the screen shows what was just saved).
+  CACHE_WRITES.filter(n => typeof be[n] === 'function').forEach(n => {
+    const fn = be[n];
+    be[n] = async (...a) => { memo.clear(); try { return await fn.apply(be, a); } finally { memo.clear(); } };
+  });
+  be.clearCache = () => memo.clear();
   return be;
 }
 
@@ -320,7 +351,7 @@ function demoBackend() {
   coaching.push({ id: 'seed1', store: tp.store, cid: tp.cid, name: tp.name, coach: 'director@demo', coachName: 'Demo Director',
     date: '2026-09-22', createdAt: '2026-09-22T15:00:00Z', focus: f,
     commitment: f.map(x => COACHING[x.key].doThis).join(' '), support: 'I will shadow two of your guests on Saturday.', notes: '' });
-  return be;
+  return withReadCache(be);
 }
 
 // ---------------------------------------------------------------- state
